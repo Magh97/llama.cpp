@@ -1,5 +1,9 @@
 # Bonsai 2 27B (PTQ1_0 ternary) on Intel Arc B580
 
+https://github.com/user-attachments/assets/b6df0d56-1492-4d38-8f28-8fd323ffb92b
+
+*Real time in the llama.cpp web UI on a B580: a new ~1000-token answer at ~65 t/s, then a whole-file edit at ~205 t/s (temperature 0, 128K context).*
+
 This branch makes PrismML's ternary Bonsai 2 27B run fast on a 12 GB Intel Arc B580 (Xe2, "Battlemage") with the SYCL
 backend, at the full 128K context. The Vulkan backend got most of the same kernel work, but SYCL is clearly faster on
 this card.
