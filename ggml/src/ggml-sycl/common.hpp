@@ -60,6 +60,8 @@ void ggml_sycl_host_free(void* ptr);
 
 extern int g_ggml_sycl_debug;
 extern int g_ggml_sycl_enable_optimize;
+extern int g_ggml_sycl_quant_f16_gemm;
+extern int g_ggml_sycl_quant_s4_gemm;
 extern int g_ggml_sycl_enable_fusion;
 extern int g_ggml_sycl_enable_esimd;
 extern int g_ggml_sycl_prioritize_dmmv;
@@ -224,6 +226,7 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
 //////////////////////
 struct optimize_feature {
     bool reorder=false;
+    bool t2=false;  // ARC-LAB: PTQ1_0 repacked to the TernSYCL 2-bit layout (ptq1-t2.cpp)
 };
 
 struct sycl_device_info {
