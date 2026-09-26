@@ -1,5 +1,11 @@
 # llama.cpp
 
+> [!NOTE]
+> **This is the `arc-b580` branch: Bonsai 2 27B (PrismML ternary PTQ1_0) running fast on a 12 GB Intel Arc B580.**
+> At 128K context: ~83 t/s on fresh code with speculative decoding, 250-360 t/s on edits, ~41 t/s plain decode.
+> Build, run and results: **[docs/bonsai-arc-b580.md](docs/bonsai-arc-b580.md)**. Everything below is upstream llama.cpp.
+
+
 > [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
 >
