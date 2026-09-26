@@ -65,7 +65,24 @@ The first long prompt after the very first start compiles the XMX kernels (about
 that. If the server ever hangs during start-up in GPU initialisation after being killed mid-compile, move
 `~/.cache/neo_compiler_cache` aside.
 
-## Switches
+## Build and run (Vulkan)
+
+SYCL is faster on the B580 (see the table), but the Vulkan backend has most of the same kernel work and runs on any
+Vulkan driver. Tested on Mesa ANV 26.2. Needs the Vulkan SDK (glslc and headers).
+
+```sh
+cmake -B build-vk -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-vk -j --target llama-server llama-bench llama-cli
+./build-vk/bin/llama-server -m <bonsai-2-27b-ptq1_0-with-mtp>.gguf -ngl 99 \
+  -c 131072 -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -np 1 \
+  --spec-type draft-mtp,ngram-mod --spec-draft-n-max 3 --spec-ngram-mod-n-max 256 \
+  -ub 2048 -b 2048 --chat-template-kwargs '{"enable_thinking":false}' --host 0.0.0.0 --port 8080
+```
+
+At 128K this left about 1.2 GB of VRAM free on the B580. The `GGML_SYCL_*` switches below do not apply to Vulkan; its
+new paths can be turned off with `GGML_VK_PTQ1_MC_OFF=1` (multi-column PTQ1_0 mat-vec).
+
+## Switches (SYCL)
 
 All optimisations are on by default except the XMX path. Set any of these to turn a piece off for comparison:
 `GGML_SYCL_PTQ1_T2_GEMM_OFF`, `GGML_SYCL_PTQ1_MULTI=0`, `GGML_SYCL_PTQ1_MULTI_NCOLS=0`, `GGML_SYCL_PTQ1_GLU1=0`,
