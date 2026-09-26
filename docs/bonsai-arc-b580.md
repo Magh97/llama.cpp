@@ -89,6 +89,12 @@ All optimisations are on by default except the XMX path. Set any of these to tur
 `GGML_SYCL_PTQ1_PAIRS=0`, `GGML_SYCL_PTQ1_NCOLS_DEC_OFF`, `GGML_SYCL_FA_DEC_OFF`, `GGML_SYCL_GDN_BLOCKED_OFF`,
 `GGML_SYCL_GLU_FUSE_OFF`.
 
+## Feedback and your numbers
+
+If you run this on a B580 or another Arc card, please post your results (card, driver, context, the numbers you get) in
+this repository's Discussions, and report problems as issues. Results from other setups are the most useful thing
+right now.
+
 ## Credits
 
 Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), PrismML's PTQ1_0 support, and the `bonsai-combo`
