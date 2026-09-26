@@ -17,8 +17,13 @@ speculative decoding on (MTP head, 3 drafts, plus n-gram drafts), thinking off.
 | Plain generation, no speculation  | 41 t/s             | 32 t/s               |
 | 29K-token document: prompt / gen  | 786 / 40 t/s       | 281 / 29 t/s         |
 
-Speculation speed depends on the text. New prose drafts worse than code (expect roughly 50-60 t/s); rewriting text that
-is already in the conversation drafts very well. Quality: KL divergence against the reference logits is 0.00022
+These are greedy (temperature 0) numbers on short benchmark prompts. Speculation speed depends on the text and the
+sampling: in the chat UI at temperature 0 a ~1000-token new answer ran at about 65 t/s and returning a whole edited file
+at about 205 t/s. With sampling (temperature 0.6) fewer drafts are accepted: roughly 60-65 t/s for new code and 90-100
+t/s for edits. New prose drafts worse than code.
+
+Against the first working SYCL port of this model (same card, same settings, 32K context): fresh code 55.8 -> 85.5 t/s,
+rename 217.5 -> 368.8, edit 143.0 -> 255.1, plain generation 31.4 -> 40.7. Quality: KL divergence against the reference logits is 0.00022
 (99.2% same top token; the plain PTQ1_0 kernels score 0.0003), and greedy outputs on our test prompts are byte-identical to the plain PTQ1_0 kernels.
 
 ## What changed
