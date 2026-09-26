@@ -26,6 +26,18 @@ Against the first working SYCL port of this model (same card, same settings, 32K
 rename 217.5 -> 368.8, edit 143.0 -> 255.1, plain generation 31.4 -> 40.7. Quality: KL divergence against the reference logits is 0.00022
 (99.2% same top token; the plain PTQ1_0 kernels score 0.0003), and greedy outputs on our test prompts are byte-identical to the plain PTQ1_0 kernels.
 
+## Model
+
+The speculative numbers need a PTQ1_0 GGUF that includes the MTP head. PrismML's own
+[Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) PTQ1_0 file has no MTP head
+(use `--spec-type ngram-mod` with it). A public build with the head grafted on is
+[sudoingx/Ternary-Bonsai-2-27B-PTQ1_0-MTP-GGUF](https://huggingface.co/sudoingx/Ternary-Bonsai-2-27B-PTQ1_0-MTP-GGUF),
+file `Ternary-Bonsai-2-27B-PTQ1_0-mtp-lean.gguf` (6.3 GB).
+
+The table above was measured on my own derivative of Bonsai 2 27B with the same MTP head. With the public mtp-lean file
+on the same card, build and settings (128K): fresh code 77 t/s, rename 306 t/s, edit 205 t/s, plain generation 38 t/s.
+Different weights produce different text, so speculation lands a little less often.
+
 ## What changed
 
 - **Ternary weights on the XMX matrix units.** At load, every PTQ1_0 weight is repacked in place to a 2-bit layout and
@@ -56,7 +68,7 @@ cmake --build build-sycl -j --target llama-server llama-bench llama-cli
 source /opt/intel/oneapi/setvars.sh
 export GGML_SYCL_PTQ1_T2=all              # PTQ1_0 weights on XMX (ffn = feed-forward only, unset = off)
 export LLAMA_ARG_SPEC_DRAFT_UBATCH=512    # smaller compute buffer for the MTP draft context
-./build-sycl/bin/llama-server -m <bonsai-2-27b-ptq1_0-with-mtp>.gguf -ngl 99 \
+./build-sycl/bin/llama-server -m Ternary-Bonsai-2-27B-PTQ1_0-mtp-lean.gguf -ngl 99 \
   -c 131072 -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -np 1 \
   --spec-type draft-mtp,ngram-mod --spec-draft-n-max 3 --spec-ngram-mod-n-max 256 \
   -ub 1024 -b 2048 --chat-template-kwargs '{"enable_thinking":false}' --host 0.0.0.0 --port 8080
@@ -78,7 +90,7 @@ Vulkan driver. Tested on Mesa ANV 26.2. Needs the Vulkan SDK (glslc and headers)
 ```sh
 cmake -B build-vk -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-vk -j --target llama-server llama-bench llama-cli
-./build-vk/bin/llama-server -m <bonsai-2-27b-ptq1_0-with-mtp>.gguf -ngl 99 \
+./build-vk/bin/llama-server -m Ternary-Bonsai-2-27B-PTQ1_0-mtp-lean.gguf -ngl 99 \
   -c 131072 -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -np 1 \
   --spec-type draft-mtp,ngram-mod --spec-draft-n-max 3 --spec-ngram-mod-n-max 256 \
   -ub 2048 -b 2048 --chat-template-kwargs '{"enable_thinking":false}' --host 0.0.0.0 --port 8080
