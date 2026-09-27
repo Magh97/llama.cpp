@@ -112,9 +112,45 @@ cmake --build build-vk -j --target llama-server llama-bench llama-cli
 At 128K this left about 1.2 GB of VRAM free on the B580. The `GGML_SYCL_*` switches below do not apply to Vulkan; its
 new paths can be turned off with `GGML_VK_PTQ1_MC_OFF=1` (multi-column PTQ1_0 mat-vec).
 
+## Ternary Bonsai 8B
+
+PrismML's smaller [Ternary Bonsai 8B](https://huggingface.co/prism-ml/Ternary-Bonsai-8B-gguf) (`Ternary-Bonsai-8B-PQ2_0.gguf`,
+2 GB) also runs on the XMX path. It is the older Qwen3-based Bonsai, so it has no MTP head. Use n-gram drafts, or
+[Ternary Bonsai 1.7B](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf) (same vocabulary) as a draft model:
+
+```sh
+source /opt/intel/oneapi/setvars.sh
+export GGML_SYCL_PTQ1_T2=all
+./build-sycl/bin/llama-server -m Ternary-Bonsai-8B-PQ2_0.gguf -ngl 99 -c 32768 -ctk q4_0 -ctv q4_0 -np 1 \
+  --spec-type ngram-mod --spec-ngram-mod-n-max 256 \
+  -ub 1024 -b 2048 --chat-template-kwargs '{"enable_thinking":false}' --host 0.0.0.0 --port 8080
+# or add the 1.7B as drafter: --spec-type draft-simple,ngram-mod -md Ternary-Bonsai-1.7B-PQ2_0.gguf -ngld 99 --spec-draft-n-max 4
+```
+
+On the B580 (32K context, temperature 0):
+
+| | new code | rename | edit |
+|---|---|---|---|
+| no drafts | 100 t/s | 75 | 80 |
+| n-gram drafts | 102 | 506 | 658 |
+| 1.7B drafter + n-gram | 110 | 471 | 608 |
+
+The XMX path gives 134 t/s plain generation (118 without it) and 765 vs 408 t/s on 8-token batches, with identical
+perplexity. At 2 GB it should also suit 8 GB cards, but I've only tested it on the B580.
+
+Tool calling (first 100 of each [BFCL v3](https://gorilla.cs.berkeley.edu/leaderboard.html) category, my simplified scorer, so
+compare rows with each other only):
+
+| model | simple | multiple | parallel | no call needed |
+|---|---|---|---|---|
+| Ternary Bonsai 2 27B | 98 | 95 | 92 | 79 |
+| Ternary Bonsai 8B | 96 | 92 | 83 | 92 |
+| Gemma 4 12B (QAT q4_0) | 96 | 92 | 84 | 83 |
+
 ## Switches (SYCL)
 
-All optimisations are on by default except the XMX path. Set any of these to turn a piece off for comparison:
+All optimisations are on by default except the XMX path. The XMX path needs an Xe2 or newer GPU (Arc B-series, Lunar Lake, Panther Lake); on
+others it turns itself off with a warning. Set any of these to turn a piece off for comparison:
 `GGML_SYCL_PTQ1_T2_GEMM_OFF`, `GGML_SYCL_PTQ1_MULTI=0`, `GGML_SYCL_PTQ1_MULTI_NCOLS=0`, `GGML_SYCL_PTQ1_GLU1=0`,
 `GGML_SYCL_PTQ1_PAIRS=0`, `GGML_SYCL_PTQ1_NCOLS_DEC_OFF`, `GGML_SYCL_FA_DEC_OFF`, `GGML_SYCL_GDN_BLOCKED_OFF`,
 `GGML_SYCL_GLU_FUSE_OFF`.
