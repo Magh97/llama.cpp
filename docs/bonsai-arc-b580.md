@@ -26,6 +26,9 @@ sampling: in the chat UI at temperature 0 a ~1000-token new answer ran at about 
 at about 205 t/s. With sampling (temperature 0.6) fewer drafts are accepted: roughly 60-65 t/s for new code and 90-100
 t/s for edits. New prose drafts worse than code.
 
+Long-context recall (needle in a haystack, a passphrase hidden in Pride and Prejudice at 10%, 50% and 90% depth):
+exact at 32K, 64K and 120K tokens of context, 9 of 9.
+
 Against the first working SYCL port of this model (same card, same settings, 32K context): fresh code 55.8 -> 85.5 t/s,
 rename 217.5 -> 368.8, edit 143.0 -> 255.1, plain generation 31.4 -> 40.7. Quality: KL divergence against the reference logits is 0.00022
 (99.2% same top token; the plain PTQ1_0 kernels score 0.0003), and greedy outputs on our test prompts are byte-identical to the plain PTQ1_0 kernels.
@@ -72,11 +75,17 @@ cmake --build build-sycl -j --target llama-server llama-bench llama-cli
 source /opt/intel/oneapi/setvars.sh
 export GGML_SYCL_PTQ1_T2=all              # PTQ1_0 weights on XMX (ffn = feed-forward only, unset = off)
 export LLAMA_ARG_SPEC_DRAFT_UBATCH=512    # smaller compute buffer for the MTP draft context
+export GGML_SYCL_FA_ONEDNN_MAX_KV=98304   # see below: without it a ~120K-token prompt runs out of VRAM
 ./build-sycl/bin/llama-server -m Ternary-Bonsai-2-27B-PTQ1_0-mtp-lean.gguf -ngl 99 \
   -c 131072 -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -np 1 \
   --spec-type draft-mtp,ngram-mod --spec-draft-n-max 3 --spec-ngram-mod-n-max 256 \
   -ub 1024 -b 2048 --chat-template-kwargs '{"enable_thinking":false}' --host 0.0.0.0 --port 8080
 ```
+
+`GGML_SYCL_FA_ONEDNN_MAX_KV` matters at 128K: the fast prompt-attention path converts the whole KV cache to f16 (about
+4 KB per token of context), and with this configuration's ~0.5 GB of spare VRAM a prompt of about 119K tokens ran out of
+memory and took the server down. Above the cap (98304 tokens) prompt attention uses a chunked path instead: slower
+(~330 t/s prompt reading at 120K) but safe. Shorter prompts are unaffected.
 
 With a shorter context you can use `-ub 2048` for faster prompt reading. `GGML_SYCL_PTQ1_T2=ffn` puts only the
 feed-forward weights on XMX: about 380 MiB less weight memory, enough for `-ub 2048` at 128K, and most of the speed
