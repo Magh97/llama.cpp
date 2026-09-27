@@ -1,7 +1,10 @@
 llama.cpp arc-b580 branch - Windows x64 SYCL build (EXPERIMENTAL: built by CI, not yet tested on Windows)
 
-Needs: an Intel Arc GPU with a recent driver (B580 12 GB for the 27B at 128K context). Nothing else to install:
-the Intel runtime files are included.
+Needs: an Intel Arc GPU (B580 12 GB for the 27B at 128K context) and a CURRENT Intel graphics driver
+(https://www.intel.com/content/www/us/en/download/785597/intel-arc-iris-xe-graphics-windows.html).
+Nothing else to install: the Intel runtime files are included. The Level Zero loader (ze_loader.dll) comes
+with the driver, so an old driver makes sycl-ls / llama-server crash at start (0xC0000005) or fall back to CPU.
+Older iGPUs on Intel's legacy driver (UHD 6xx and earlier) are not supported.
 
 1. Download the model into this folder:
    https://huggingface.co/sudoingx/Ternary-Bonsai-2-27B-PTQ1_0-MTP-GGUF  (Ternary-Bonsai-2-27B-PTQ1_0-mtp-lean.gguf)

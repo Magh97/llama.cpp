@@ -93,5 +93,6 @@ jobs:
           prerelease: true
           body: |
             Windows x64 build of the arc-b580 branch for Intel Arc (SYCL). EXPERIMENTAL: built by CI and not yet tested on a
-            Windows machine. Unzip, put the model next to it, and run run-bonsai.bat. See README.txt and
+            Windows machine. Needs a current Intel Arc driver (an old driver's ze_loader.dll crashes at start).
+            Unzip, put the model next to it, and run run-bonsai.bat. See README.txt and
             docs/bonsai-arc-b580.md. Please report results in https://github.com/Torchit1/llama.cpp/discussions/1
