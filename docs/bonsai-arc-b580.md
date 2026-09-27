@@ -6,25 +6,27 @@ https://github.com/user-attachments/assets/b6df0d56-1492-4d38-8f28-8fd323ffb92b
 
 This branch makes PrismML's ternary Bonsai 2 27B run fast on a 12 GB Intel Arc B580 (Xe2, "Battlemage") with the SYCL
 backend, at the full 128K context. The Vulkan backend got most of the same kernel work, but SYCL is clearly faster on
-this card.
+this card. **Windows:** a prebuilt SYCL build is under [Releases](https://github.com/Torchit1/llama.cpp/releases) (experimental,
+needs a current Intel Arc driver; unzip and run `run-bonsai.bat`).
 
 ## Results
 
 B580 12 GB, Linux, oneAPI 2025.3, Level Zero driver 26.35. Everything below is at 131072 context with a q4_0 KV cache,
-speculative decoding on (MTP head, 3 drafts, plus n-gram drafts), thinking off.
+speculative decoding on (MTP head, 4 drafts, plus n-gram drafts), thinking off. Public mtp-lean model (see Model).
 
-|                                   | SYCL (this branch) | Vulkan (this branch) |
-|-----------------------------------|--------------------|----------------------|
-| Fresh code answer                 | 83 t/s             | 53 t/s               |
-| Rename a symbol in pasted code    | 361 t/s            | 194 t/s              |
-| Small edit to pasted code         | 250 t/s            | 135 t/s              |
-| Plain generation, no speculation  | 41 t/s             | 32 t/s               |
-| 29K-token document: prompt / gen  | 786 / 40 t/s       | 281 / 29 t/s         |
+|                                   | SYCL (this branch) | Vulkan (this branch, older) |
+|-----------------------------------|--------------------|-----------------------------|
+| Fresh code answer                 | 90 t/s             | 53 t/s                      |
+| Rename a symbol in pasted code    | 365 t/s            | 194 t/s                     |
+| Small edit to pasted code         | 258 t/s            | 135 t/s                     |
+| Plain generation, no speculation  | 42 t/s             | 32 t/s                      |
+| 48K tokens of code in context: new code / edit | 63 / 34 t/s | -                  |
+| ~115K tokens in context: new code / edit       | 44 / 27 t/s | -                  |
 
 These are greedy (temperature 0) numbers on short benchmark prompts. Speculation speed depends on the text and the
 sampling: in the chat UI at temperature 0 a ~1000-token new answer ran at about 65 t/s and returning a whole edited file
-at about 205 t/s. With sampling (temperature 0.6) fewer drafts are accepted: roughly 60-65 t/s for new code and 90-100
-t/s for edits. New prose drafts worse than code.
+at about 205 t/s (video above, recorded before the latest changes). With sampling (temperature 0.6) new code runs at about
+75-80 t/s. New prose drafts worse than code.
 
 Long-context recall (needle in a haystack, a passphrase hidden in Pride and Prejudice at 10%, 50% and 90% depth):
 exact at 32K, 64K and 120K tokens of context, 9 of 9.
@@ -52,7 +54,13 @@ Different weights produce different text, so speculation lands a little less oft
   vendored in `ggml/src/ggml-sycl/ternsycl`). The base-3 PTQ1_0 packing has to be decoded on the ALUs first, which made
   the multi-token verify step of speculative decoding compute-bound. The 2-bit layout costs about 31% more weight memory.
   Activations are quantized to int8 with round-to-nearest (TernSYCL truncates; rounding to nearest cut KLD 5x).
-- **Decode attention for a q4_0 KV cache** serving 1-4 query tokens per launch from one read of the cache (GQA-aware).
+- **Decode attention straight from the q4_0 KV cache on XMX** (`GGML_SYCL_FA_DEC_DPAS=1`): Q.K uses an int8 x int4 DPAS
+  builtin that IGC provides on Xe2 (`intel_sub_group_i8_i4_matrix_mad_k32`, not in the public extension list) with the raw
+  q4_0 bytes as the B operand, P.V runs on f16 DPAS, and one kernel serves 1-32 query tokens, so MTP and n-gram verify
+  batches no longer convert the whole cache to f16. Generation at 48K context +14-16%; it also removed an out-of-VRAM crash
+  near 128K. Without it, a q4_0 cache kernel serves 1-4 tokens (GQA-aware).
+- **Long prompts above the oneDNN cap:** the chunked attention path's softmax gave each query row to one work-item;
+  now a work-group per row, 2.5x faster generation at ~115K context.
 - **Gated delta-net** blocked kernel, fused state writes, and several fusions for single-token decode (same-input mat-vecs
   in one launch, narrow concat, fused gate/up).
 - **Memory for 128K on 12 GB:** the MTP draft context now takes its own KV cache type (`-ctkd/-ctvd q4_0`) and a smaller
@@ -76,9 +84,10 @@ source /opt/intel/oneapi/setvars.sh
 export GGML_SYCL_PTQ1_T2=all              # PTQ1_0 weights on XMX (ffn = feed-forward only, unset = off)
 export LLAMA_ARG_SPEC_DRAFT_UBATCH=512    # smaller compute buffer for the MTP draft context
 export GGML_SYCL_FA_ONEDNN_MAX_KV=98304   # see below: without it a ~120K-token prompt runs out of VRAM
+export GGML_SYCL_FA_DEC_DPAS=1            # decode / verify attention on XMX straight from the q4_0 cache (Xe2)
 ./build-sycl/bin/llama-server -m Ternary-Bonsai-2-27B-PTQ1_0-mtp-lean.gguf -ngl 99 \
   -c 131072 -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -np 1 \
-  --spec-type draft-mtp,ngram-mod --spec-draft-n-max 3 --spec-ngram-mod-n-max 256 \
+  --spec-type draft-mtp,ngram-mod --spec-draft-n-max 4 --spec-ngram-mod-n-max 256 \
   -ub 1024 -b 2048 --chat-template-kwargs '{"enable_thinking":false}' --host 0.0.0.0 --port 8080
 ```
 
@@ -147,13 +156,42 @@ compare rows with each other only):
 | Ternary Bonsai 8B | 96 | 92 | 83 | 92 |
 | Gemma 4 12B (QAT q4_0) | 96 | 92 | 84 | 83 |
 
+## Gemma 4 12B (bonus)
+
+Google publishes a small "assistant" draft model for the QAT Gemma 4 12B. With it (and one switch for mid-size verify
+batches) Gemma 4 12B QAT q4_0 goes from ~40 to ~92 t/s on new code on the B580:
+
+```sh
+# once: convert Google's assistant (846 MB, not gated) to GGUF
+huggingface-cli download google/gemma-4-12B-it-qat-q4_0-unquantized-assistant --local-dir gemma4-12b-assistant
+python convert_hf_to_gguf.py gemma4-12b-assistant --outtype q8_0 --outfile gemma-4-12b-it-qat-assistant-Q8_0.gguf
+
+source /opt/intel/oneapi/setvars.sh
+export GGML_SYCL_MMVQ_CHUNK_MAX=128       # 33-128 token verify batches as chunked mat-vecs, not dequantize-everything
+./build-sycl/bin/llama-server -m gemma-4-12b-it-qat-q4_0.gguf -md gemma-4-12b-it-qat-assistant-Q8_0.gguf -ngl 99 -ngld 99 \
+  -c 131072 -ctk q4_0 -ctv q4_0 -np 1 --spec-type draft-mtp,ngram-mod --spec-draft-n-max 3 --spec-ngram-mod-n-max 64 \
+  -ub 1024 -b 2048 --chat-template-kwargs '{"enable_thinking":false}' --host 0.0.0.0 --port 8080
+```
+
+| Gemma 4 12B QAT q4_0, B580 | new code | rename | edit |
+|---|---|---|---|
+| n-gram drafts only (before) | 40 t/s | 164 | 64 |
+| + assistant, ngram 64, chunk max 128 | 92 t/s | 186 | 136 |
+
+At temperature 0.6 new code is ~94 t/s. It fits 128K on the 12 GB card; at 48K of context it generates at ~42 t/s (the
+XMX decode attention above is Bonsai-shaped so far). Gemma writes slightly better code (HumanEval+ 152 vs 141 of 164);
+Bonsai is much faster on edits (~255 vs 136 t/s) and at long context.
+
 ## Switches (SYCL)
 
 All optimisations are on by default except the XMX path. The XMX path needs an Xe2 or newer GPU (Arc B-series, Lunar Lake, Panther Lake); on
 others it turns itself off with a warning. Set any of these to turn a piece off for comparison:
 `GGML_SYCL_PTQ1_T2_GEMM_OFF`, `GGML_SYCL_PTQ1_MULTI=0`, `GGML_SYCL_PTQ1_MULTI_NCOLS=0`, `GGML_SYCL_PTQ1_GLU1=0`,
 `GGML_SYCL_PTQ1_PAIRS=0`, `GGML_SYCL_PTQ1_NCOLS_DEC_OFF`, `GGML_SYCL_FA_DEC_OFF`, `GGML_SYCL_GDN_BLOCKED_OFF`,
-`GGML_SYCL_GLU_FUSE_OFF`.
+`GGML_SYCL_GLU_FUSE_OFF`, `GGML_SYCL_TOPK_OLD=1`. Opt-in: `GGML_SYCL_FA_DEC_DPAS=1` (XMX decode attention, Xe2),
+`GGML_SYCL_MMVQ_CHUNK_MAX=N` (largest quantized batch run as chunked mat-vecs, default 32). An MTP GGUF can carry a
+trimmed draft LM head (`blk.<n>.nextn.draft_head`, top-K frequent tokens; ~5% faster drafting on the B580);
+`LLAMA_MTP_DRAFT_HEAD_OFF=1` ignores it.
 
 ## Feedback and your numbers
 
