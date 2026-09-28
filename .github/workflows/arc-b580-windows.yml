@@ -77,6 +77,7 @@ jobs:
           [ -n "$ZE_LOADER_DLL" ] && cp "$ZE_LOADER_DLL" $B/
           cp docs/bonsai-arc-b580-windows/run-bonsai.bat $B/
           cp docs/bonsai-arc-b580-windows/README.txt $B/
+          cp docs/bonsai-arc-b580-windows/bonsai-chat-template.jinja $B/
           7z a -snl llama-arc-b580-win-sycl-x64.zip $B/*
 
       - name: Upload artifact

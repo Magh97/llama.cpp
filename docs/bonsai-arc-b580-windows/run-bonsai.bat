@@ -12,6 +12,7 @@ rem decode / verify attention on XMX straight from the q4_0 cache (Xe2). Set to 
 set GGML_SYCL_FA_DEC_DPAS=1
 rem full 1024-token prompt batches via oneDNN's int8 GEMM (~10% faster long prompts)
 set GGML_SYCL_T2_W8A8_MIN=1024
+rem bonsai-chat-template.jinja = the model's template, but accepts the mid-conversation system notes Claude Code sends
 rem less VRAM or a smaller card: lower -c (e.g. 32768)
-llama-server.exe -m "%MODEL%" -ngl 99 -c 131072 -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -np 1 --spec-type draft-mtp,ngram-mod --spec-draft-n-max 4 --spec-ngram-mod-n-max 256 -ub 1024 -b 2048 --chat-template-kwargs "{\"enable_thinking\":false}" --host 127.0.0.1 --port 8080
+llama-server.exe -m "%MODEL%" -ngl 99 -c 131072 -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -np 1 --spec-type draft-mtp,ngram-mod --spec-draft-n-max 4 --spec-ngram-mod-n-max 256 -ub 1024 -b 2048 --chat-template-kwargs "{\"enable_thinking\":false}" --host 127.0.0.1 --port 8080 --jinja --chat-template-file "%~dp0bonsai-chat-template.jinja"
 pause

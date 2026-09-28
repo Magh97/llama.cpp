@@ -35,6 +35,21 @@ Against the first working SYCL port of this model (same card, same settings, 32K
 rename 217.5 -> 368.8, edit 143.0 -> 255.1, plain generation 31.4 -> 40.7. Quality: KL divergence against the reference logits is 0.00022
 (99.2% same top token; the plain PTQ1_0 kernels score 0.0003), and greedy outputs on our test prompts are byte-identical to the plain PTQ1_0 kernels.
 
+Against PrismML's own fork, which added basic SYCL support for PTQ1_0 / PQ2_0 on 24 September (prism branch at 8444536,
+27 Sep). Same B580, same public mtp-lean model, q4_0 KV cache, flash attention; the chat rows use identical server flags
+(32K context, MTP depth 3, no n-gram drafts):
+
+|                                         | PrismML fork | this branch |       |
+|-----------------------------------------|--------------|-------------|-------|
+| Prompt reading (llama-bench pp512)      | 207 t/s      | 895 t/s     | 4.3x  |
+| Plain generation (tg128)                | 20.6 t/s     | 42.3 t/s    | 2.1x  |
+| Generation with 32K tokens in context   | 8.1 t/s      | 35.8 t/s    | 4.4x  |
+| Chat, fresh code, MTP drafts            | 37.6 t/s     | 88.4 t/s    | 2.35x |
+| Chat, fresh code, no drafts             | 20.3 t/s     | 40.7 t/s    | 2.0x  |
+
+Draft acceptance was the same on both (166/210 vs 165/213), so the gap is the kernels: the XMX units for the weights and
+for attention.
+
 ## Model
 
 The speculative numbers need a PTQ1_0 GGUF that includes the MTP head. PrismML's own
@@ -91,8 +106,13 @@ export GGML_SYCL_T2_W8A8_MIN=1024         # full 1024-token prompt batches via o
 ./build-sycl/bin/llama-server -m Ternary-Bonsai-2-27B-PTQ1_0-mtp-lean.gguf -ngl 99 \
   -c 131072 -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -np 1 \
   --spec-type draft-mtp,ngram-mod --spec-draft-n-max 4 --spec-ngram-mod-n-max 256 \
-  -ub 1024 -b 2048 --chat-template-kwargs '{"enable_thinking":false}' --host 0.0.0.0 --port 8080
+  -ub 1024 -b 2048 --chat-template-kwargs '{"enable_thinking":false}' --host 0.0.0.0 --port 8080 \
+  --jinja --chat-template-file docs/bonsai-arc-b580-windows/bonsai-chat-template.jinja
 ```
+
+The chat template file is the model's own template with one change: a system message in the middle of a conversation
+becomes a note in a user turn instead of an error. Coding agents such as Claude Code send those (see below); plain chat
+is unaffected.
 
 `GGML_SYCL_FA_ONEDNN_MAX_KV` matters at 128K: the fast prompt-attention path converts the whole KV cache to f16 (about
 4 KB per token of context), and with this configuration's ~0.5 GB of spare VRAM a prompt of about 119K tokens ran out of
@@ -106,6 +126,42 @@ feed-forward weights on XMX: about 380 MiB less weight memory, enough for `-ub 2
 The first long prompt after the very first start compiles the XMX kernels (about 30 s); the GPU driver caches them after
 that. If the server ever hangs during start-up in GPU initialisation after being killed mid-compile, move
 `~/.cache/neo_compiler_cache` aside.
+
+## As a coding agent (Claude Code)
+
+llama-server speaks the Anthropic Messages API, so Claude Code can use Bonsai as its model: file reads and edits, shell
+commands and tests, all running locally on the card. Start the server as above (with the chat template file), then:
+
+```sh
+export ANTHROPIC_BASE_URL=http://localhost:8080 ANTHROPIC_AUTH_TOKEN=local ANTHROPIC_MODEL=bonsai
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=bonsai ANTHROPIC_DEFAULT_SONNET_MODEL=bonsai ANTHROPIC_DEFAULT_OPUS_MODEL=bonsai
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+claude
+```
+
+(Windows PowerShell: `$env:ANTHROPIC_BASE_URL="http://localhost:8080"` and so on.) Claude Code warns that it doesn't
+know the model name; that's harmless.
+
+It works well. Asked for a Snake game with its logic unit-tested in Node, it wrote the game and a test suite, ran the
+tests, fixed the one failure and re-ran them to a clean pass, in about 5.5 minutes. Things that helped:
+
+- A `CLAUDE.md` in the project with a few rules. Without them it tends to build more than asked:
+
+  ```markdown
+  # Rules
+  - Build only what was asked. No extra features, themes, settings or polish unless requested.
+  - Prefer the simplest code that works. Small files, few functions.
+  - After every change, run the tests. Never say a test passed unless you ran it this turn and saw the output.
+  - If a tool call fails, say so and retry. Never report a failed edit as done.
+  - End each task by listing exactly which commands you ran and their results.
+  ```
+
+- Patience on the first turn: Claude Code's instructions and tool list are about 20-27K tokens, which take about 30 s to
+  read. Later turns reuse the cache and start quickly.
+- One user at a time (`-np 1`): the web UI and the agent share the one slot.
+
+Believe the tool output rather than the summary, as with any local model. For comparison, Gemma 4 12B (below) is faster
+but skipped steps and reported tests as passed without running them, so Bonsai is the one to use as an agent.
 
 ## Build and run (Vulkan)
 
