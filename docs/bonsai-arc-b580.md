@@ -59,6 +59,8 @@ Different weights produce different text, so speculation lands a little less oft
   q4_0 bytes as the B operand, P.V runs on f16 DPAS, and one kernel serves 1-32 query tokens, so MTP and n-gram verify
   batches no longer convert the whole cache to f16. Generation at 48K context +14-16%; it also removed an out-of-VRAM crash
   near 128K. Without it, a q4_0 cache kernel serves 1-4 tokens (GQA-aware).
+- **Long prompts:** full 1024-token prompt batches convert the 2-bit weights to int8 and use oneDNN's int8 GEMM
+  (`GGML_SYCL_T2_W8A8_MIN=1024`), which beats the TernSYCL GEMM at that size: a 48K-token code prompt reads at ~800 t/s.
 - **Long prompts above the oneDNN cap:** the chunked attention path's softmax gave each query row to one work-item;
   now a work-group per row, 2.5x faster generation at ~115K context.
 - **Gated delta-net** blocked kernel, fused state writes, and several fusions for single-token decode (same-input mat-vecs
@@ -85,6 +87,7 @@ export GGML_SYCL_PTQ1_T2=all              # PTQ1_0 weights on XMX (ffn = feed-fo
 export LLAMA_ARG_SPEC_DRAFT_UBATCH=512    # smaller compute buffer for the MTP draft context
 export GGML_SYCL_FA_ONEDNN_MAX_KV=98304   # see below: without it a ~120K-token prompt runs out of VRAM
 export GGML_SYCL_FA_DEC_DPAS=1            # decode / verify attention on XMX straight from the q4_0 cache (Xe2)
+export GGML_SYCL_T2_W8A8_MIN=1024         # full 1024-token prompt batches via oneDNN's int8 GEMM: ~10% faster long prompts
 ./build-sycl/bin/llama-server -m Ternary-Bonsai-2-27B-PTQ1_0-mtp-lean.gguf -ngl 99 \
   -c 131072 -ctk q4_0 -ctv q4_0 -ctkd q4_0 -ctvd q4_0 -np 1 \
   --spec-type draft-mtp,ngram-mod --spec-draft-n-max 4 --spec-ngram-mod-n-max 256 \
@@ -158,8 +161,10 @@ compare rows with each other only):
 
 ## Gemma 4 12B (bonus)
 
-Google publishes a small "assistant" draft model for the QAT Gemma 4 12B. With it (and one switch for mid-size verify
-batches) Gemma 4 12B QAT q4_0 goes from ~40 to ~92 t/s on new code on the B580:
+Google publishes a small "assistant" draft model for the QAT Gemma 4 12B, and the same XMX work covers Gemma's shapes:
+the int8 x int4 decode attention handles its global (head 512) and sliding (head 256) layers, and a q4_0 small-batch GEMM
+on XMX streams the weights once for verify batches of 5-256 tokens. Together Gemma 4 12B QAT q4_0 goes from ~40 to ~100
+t/s on new code on the B580:
 
 ```sh
 # once: convert Google's assistant (846 MB, not gated) to GGUF
@@ -167,20 +172,22 @@ huggingface-cli download google/gemma-4-12B-it-qat-q4_0-unquantized-assistant --
 python convert_hf_to_gguf.py gemma4-12b-assistant --outtype q8_0 --outfile gemma-4-12b-it-qat-assistant-Q8_0.gguf
 
 source /opt/intel/oneapi/setvars.sh
-export GGML_SYCL_MMVQ_CHUNK_MAX=128       # 33-128 token verify batches as chunked mat-vecs, not dequantize-everything
+export GGML_SYCL_FA_DEC_DPAS=1            # XMX decode attention (Gemma global + sliding layers too)
+export GGML_SYCL_Q4_0_DPAS=1              # q4_0 verify batches of 5-256 tokens on XMX (weights streamed once)
+export GGML_SYCL_MMVQ_CHUNK_MAX=128       # anything else up to 128 tokens as chunked mat-vecs, not dequantize-everything
 ./build-sycl/bin/llama-server -m gemma-4-12b-it-qat-q4_0.gguf -md gemma-4-12b-it-qat-assistant-Q8_0.gguf -ngl 99 -ngld 99 \
-  -c 131072 -ctk q4_0 -ctv q4_0 -np 1 --spec-type draft-mtp,ngram-mod --spec-draft-n-max 3 --spec-ngram-mod-n-max 64 \
+  -c 131072 -ctk q4_0 -ctv q4_0 -np 1 --spec-type draft-mtp,ngram-mod --spec-draft-n-max 3 --spec-ngram-mod-n-max 96 \
   -ub 1024 -b 2048 --chat-template-kwargs '{"enable_thinking":false}' --host 0.0.0.0 --port 8080
 ```
 
-| Gemma 4 12B QAT q4_0, B580 | new code | rename | edit |
-|---|---|---|---|
-| n-gram drafts only (before) | 40 t/s | 164 | 64 |
-| + assistant, ngram 64, chunk max 128 | 92 t/s | 186 | 136 |
+| Gemma 4 12B QAT q4_0, B580, 128K context | new code | rename | edit | new code / edit at 48K |
+|---|---|---|---|---|
+| n-gram drafts only | 40 t/s | 164 | 64 | - |
+| + assistant (3 drafts) | 92 | 186 | 136 | 47 / 44 |
+| + XMX attention and q4_0 GEMM (above) | **102** | **275** | **168** | **65 / 57** |
 
-At temperature 0.6 new code is ~94 t/s. It fits 128K on the 12 GB card; at 48K of context it generates at ~42 t/s (the
-XMX decode attention above is Bonsai-shaped so far). Gemma writes slightly better code (HumanEval+ 152 vs 141 of 164);
-Bonsai is much faster on edits (~255 vs 136 t/s) and at long context.
+About 100 t/s on new code at temperature 0.6 too. Gemma writes slightly better code (HumanEval+ 152 vs 141 of 164) and is
+faster on new code; Bonsai is faster on edits (~255 vs 168 t/s) and renames (~370 vs 275).
 
 ## Switches (SYCL)
 
@@ -189,7 +196,8 @@ others it turns itself off with a warning. Set any of these to turn a piece off 
 `GGML_SYCL_PTQ1_T2_GEMM_OFF`, `GGML_SYCL_PTQ1_MULTI=0`, `GGML_SYCL_PTQ1_MULTI_NCOLS=0`, `GGML_SYCL_PTQ1_GLU1=0`,
 `GGML_SYCL_PTQ1_PAIRS=0`, `GGML_SYCL_PTQ1_NCOLS_DEC_OFF`, `GGML_SYCL_FA_DEC_OFF`, `GGML_SYCL_GDN_BLOCKED_OFF`,
 `GGML_SYCL_GLU_FUSE_OFF`, `GGML_SYCL_TOPK_OLD=1`. Opt-in: `GGML_SYCL_FA_DEC_DPAS=1` (XMX decode attention, Xe2),
-`GGML_SYCL_MMVQ_CHUNK_MAX=N` (largest quantized batch run as chunked mat-vecs, default 32). An MTP GGUF can carry a
+`GGML_SYCL_MMVQ_CHUNK_MAX=N` (largest quantized batch run as chunked mat-vecs, default 32), `GGML_SYCL_Q4_0_DPAS=1`
+(q4_0 verify batches on XMX, Xe2), `GGML_SYCL_T2_W8A8_MIN=N` (prompt batches of N+ tokens via oneDNN int8, 0 = off). An MTP GGUF can carry a
 trimmed draft LM head (`blk.<n>.nextn.draft_head`, top-K frequent tokens; ~5% faster drafting on the B580);
 `LLAMA_MTP_DRAFT_HEAD_OFF=1` ignores it.
 
