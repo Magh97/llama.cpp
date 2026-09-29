@@ -1,0 +1,99 @@
+# Windows x64 SYCL build of the arc-b580 branch (Intel Arc, Bonsai 2 ternary kernels).
+# Run it by hand (Actions -> "Arc B580 Windows build" -> Run workflow) to get a zip as a workflow artifact,
+# or push a tag named arc-b580-v* to also attach the zip to a GitHub release.
+name: Arc B580 Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'arc-b580-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-sycl:
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/b60765d1-2b85-4e85-86b6-cb0e9563a699/intel-deep-learning-essentials-2025.3.3.18_offline.exe
+      WINDOWS_DPCPP_MKL: intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.dnnl:intel.oneapi.win.tbb.devel
+      LEVEL_ZERO_SDK_URL: https://github.com/oneapi-src/level-zero/releases/download/v1.28.2/level-zero-win-sdk-1.28.2.zip
+      ONEAPI_ROOT: "C:/Program Files (x86)/Intel/oneAPI"
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Download & Install oneAPI
+        run: |
+          scripts/install-oneapi.bat $WINDOWS_BASEKIT_URL $WINDOWS_DPCPP_MKL
+
+      - name: Install Level Zero SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "${{ env.LEVEL_ZERO_SDK_URL }}" -OutFile "level-zero-win-sdk.zip"
+          Expand-Archive -Path "level-zero-win-sdk.zip" -DestinationPath "C:/level-zero-sdk" -Force
+          "LEVEL_ZERO_V1_SDK_PATH=C:/level-zero-sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Setup Node.js (web UI)
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "tools/ui/package-lock.json"
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 --force
+          cmake -G "Ninja" -B build ^
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=icx ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DBUILD_SHARED_LIBS=ON -DGGML_SYCL=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --target llama-server llama-cli llama-bench -j %NUMBER_OF_PROCESSORS%
+
+      - name: Package
+        run: |
+          B=./build/bin
+          R="${{ env.ONEAPI_ROOT }}"
+          for f in mkl/latest/bin/mkl_sycl_blas.5.dll mkl/latest/bin/mkl_core.2.dll mkl/latest/bin/mkl_tbb_thread.2.dll \
+                   compiler/latest/bin/ur_adapter_level_zero.dll compiler/latest/bin/ur_adapter_level_zero_v2.dll \
+                   compiler/latest/bin/ur_adapter_opencl.dll compiler/latest/bin/ur_loader.dll compiler/latest/bin/ur_win_proxy_loader.dll \
+                   compiler/latest/bin/sycl8.dll compiler/latest/bin/svml_dispmd.dll compiler/latest/bin/libmmd.dll \
+                   compiler/latest/bin/libiomp5md.dll compiler/latest/bin/sycl-ls.exe \
+                   compiler/latest/bin/libsycl-fallback-bfloat16.spv compiler/latest/bin/libsycl-native-bfloat16.spv \
+                   dnnl/latest/bin/dnnl.dll tbb/latest/bin/tbb12.dll tcm/latest/bin/tcm.dll tcm/latest/bin/libhwloc-15.dll \
+                   umf/latest/bin/umf.dll; do
+            cp "$R/$f" $B/
+          done
+          ZE_LOADER_DLL=$(find "$R" "$LEVEL_ZERO_V1_SDK_PATH" -iname ze_loader.dll -print -quit 2>/dev/null || true)
+          [ -n "$ZE_LOADER_DLL" ] && cp "$ZE_LOADER_DLL" $B/
+          cp docs/bonsai-arc-b580-windows/run-bonsai.bat $B/
+          cp docs/bonsai-arc-b580-windows/README.txt $B/
+          cp docs/bonsai-arc-b580-windows/bonsai-chat-template.jinja $B/
+          7z a -snl llama-arc-b580-win-sycl-x64.zip $B/*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-arc-b580-win-sycl-x64.zip
+          name: llama-arc-b580-win-sycl-x64.zip
+
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: llama-arc-b580-win-sycl-x64.zip
+          prerelease: true
+          body: |
+            Windows x64 build of the arc-b580 branch for Intel Arc (SYCL). EXPERIMENTAL: built by CI and not yet tested on a
+            Windows machine. Needs a current Intel Arc driver (an old driver's ze_loader.dll crashes at start).
+            Unzip, put the model next to it, and run run-bonsai.bat. See README.txt and
+            docs/bonsai-arc-b580.md. Please report results in https://github.com/Torchit1/llama.cpp/discussions/1

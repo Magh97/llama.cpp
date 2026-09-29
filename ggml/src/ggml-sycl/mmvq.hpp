@@ -73,24 +73,18 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(
     int                stride_col_dst,       // floats between output columns in dst
     dpct::queue_ptr    stream);
 
+// ARC-LAB: PTQ1_0 decode-once multi-column mat-vec on (GGML_SYCL_PTQ1_NCOLS_DEC_OFF unset); its activations must be
+// quantized with quantize_and_reorder_q8_1_ptq1_il (plain path: 2..8 columns; fused gate/up path: 1..8 columns)
+bool ggml_sycl_ptq1_0_ncols_dec_enabled();
+// ARC-LAB: single-column PTQ1_0 helpers (pairs kernel)
+bool ggml_sycl_ptq1_0_glu_n1_enabled();
+bool ggml_sycl_ptq1_0_mul_mat_vec_multi(const void * const * vx, float * const * dst, const int * nrows, const int nm,
+                                        const void * vy, const int ncols, dpct::queue_ptr stream);
+bool ggml_sycl_ptq1_0_mul_mat_vec_multi_ncols(const void * const * vx, float * const * dst, const int * nrows,
+                                              const int nm, const void * vy, const int ncols, const int ncols_dst,
+                                              const int stride_col_y_bytes, dpct::queue_ptr stream);
 
-// Fused dense-FFN GEMV + GLU over the standard (non-reorder) layout; the gate and up
-// weights may carry different block types (q5_K / iq4_xs, mixed included).
-// vy: src1 quantized with plain quantize_q8_1 (padded rows). stride_col_y is in
-// block_q8_1 units. Returns false if the pair or batch is unhandled; caller falls back.
-bool ggml_sycl_mul_mat_vec_q_glu_plain(
-    enum ggml_type     gate_type,
-    enum ggml_type     up_type,
-    enum ggml_glu_op   glu_op,
-    const void *       vgate,
-    const void *       vup,
-    const void *       vy,
-    float *            dst,
-    int                ncols,                // K, shared by both weights
-    int                nrows,                // output rows, i.e. weight ne[1]
-    int                ncols_dst,            // activation columns, 1..MMVQ_MAX_BATCH_SIZE
-    int                stride_col_y,         // block_q8_1 units between activation columns
-    int                stride_col_dst,       // floats between output columns in dst
-    dpct::queue_ptr    stream);
-
+// ARC-LAB: reordered q4_0 x f32, 1..64 columns, weights streamed once on XMX (s8 x s4 DPAS, Xe2)
+bool ggml_sycl_q4_0_dpas_gemm(ggml_backend_sycl_context & ctx, const void * vx, const float * x, int64_t x_stride,
+                              float * dst, int nrows, int ncols, int ntok, dpct::queue_ptr stream);
 #endif // GGML_SYCL_MMVQ_HPP

@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
+#include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
@@ -14,7 +15,6 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
-#include "tiled/tiled.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -234,6 +234,18 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_Q2_0] = {
         .from_float               = quantize_row_q2_0,
         .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_PQ2_0] = {
+        .from_float               = quantize_row_pq2_0,
+        .vec_dot                  = ggml_vec_dot_pq2_0_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_PTQ1_0] = {
+        .from_float               = quantize_row_ptq1_0,
+        .vec_dot                  = ggml_vec_dot_ptq1_0_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
@@ -459,7 +471,7 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #define ggml_lock_init(x)    UNUSED(x)
 #define ggml_lock_destroy(x) UNUSED(x)
-#if defined(__x86_64__) || (defined(_MSC_VER) && defined(_M_AMD64) && !defined(_M_ARM64EC))
+#if defined(__x86_64__) || (defined(_MSC_VER) && defined(_M_AMD64))
 #define ggml_lock_lock(x)    _mm_pause()
 #else
 #define ggml_lock_lock(x)    UNUSED(x)
@@ -1162,6 +1174,33 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
+// PQ2_0 stores 128 weights per block, so any multiple of 128 is a legal row width and models in
+// the wild contain rows of 128, 384, 640, ... The fast PQ2_0 kernels consume Q8_K activations,
+// which only exist in 256-element blocks; a row that is not a multiple of 256 cannot be expressed
+// in Q8_K at all, and forcing it through that path reads past the activation buffer and returns
+// garbage (or trips ggml_row_size's block-size assert on builds where it is enabled).
+//
+// Those rows keep the Q8_0 activation path they used before the Q8_K kernels landed: correct, and
+// still the AVX2 kernel rather than the generic scalar dot. Every other PQ2_0 row, which is the
+// overwhelming majority in practice, is untouched and keeps the faster Q8_K path.
+static inline bool ggml_cpu_pq2_needs_q8_0(const struct ggml_tensor * src0) {
+    return src0->type == GGML_TYPE_PQ2_0 && (src0->ne[0] % QK_K) != 0;
+}
+
+static inline enum ggml_type ggml_cpu_vec_dot_type(const struct ggml_tensor * src0) {
+    if (ggml_cpu_pq2_needs_q8_0(src0)) {
+        return GGML_TYPE_Q8_0;
+    }
+    return type_traits_cpu[src0->type].vec_dot_type;
+}
+
+static inline ggml_vec_dot_t ggml_cpu_vec_dot(const struct ggml_tensor * src0) {
+    if (ggml_cpu_pq2_needs_q8_0(src0)) {
+        return ggml_vec_dot_pq2_0_q8_0;
+    }
+    return type_traits_cpu[src0->type].vec_dot;
+}
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1179,8 +1218,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
-    enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    ggml_vec_dot_t const vec_dot      = ggml_cpu_vec_dot(src0);
+    enum ggml_type const vec_dot_type = ggml_cpu_vec_dot_type(src0);
 
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
@@ -1265,17 +1304,12 @@ void ggml_compute_forward_mul_mat(
         return;
     }
 
-    // If tiled is supported, it will execute the full op here and we return
-    if (ggml_compute_forward_mul_mat_tiled(params, dst)) {
-        return;
-    }
-
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
     const int nth = params->nth;
 
-    enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
+    enum ggml_type           const vec_dot_type         = ggml_cpu_vec_dot_type(src0);
     ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
     int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
 
@@ -1334,9 +1368,9 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
-        // the F16 path below writes plain floats into wdata, so it needs an F32 vec_dot_type
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 || vec_dot_type == GGML_TYPE_F32);
+        // F16 src1 converts straight to float, so wdata rows must be floats; a quantized vec_dot_type would overrun the buffer
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 ||
+                    (src1->type == GGML_TYPE_F16 && vec_dot_type == GGML_TYPE_F32));
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1494,8 +1528,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     const enum ggml_type type = src0->type;
 
-    ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
-    enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    ggml_vec_dot_t    const vec_dot      = ggml_cpu_vec_dot(src0);
+    enum ggml_type    const vec_dot_type = ggml_cpu_vec_dot_type(src0);
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -1562,7 +1596,7 @@ static void ggml_compute_forward_mul_mat_id(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
+    enum ggml_type    const vec_dot_type    = ggml_cpu_vec_dot_type(src0);
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
 
     // we don't support permuted src0 or src1
@@ -1593,10 +1627,6 @@ static void ggml_compute_forward_mul_mat_id(
 
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
-
-    // Tiled matmul (see tiled.h); per-thread work buffers, 0 bytes when disabled. The
-    // reservation is unconditional, the per expert eligibility is decided at dispatch time
-    char * tiled_scratch = incr_ptr_aligned(&wdata_cur, ggml_tiled_wdata_size(nth, dst), 64);
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
@@ -1666,11 +1696,6 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
-            continue;
-        }
-
-        // tiled takes over if profitable for this expert (see tiled.h)
-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 
@@ -2334,7 +2359,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
-                case GGML_GLU_OP_SWIGLU_CLAMP:
                     {
                         n_tasks = n_threads;
                     } break;
@@ -2876,13 +2900,11 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MUL_MAT:
                     {
-                        const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
+                        const enum ggml_type vec_dot_type = ggml_cpu_vec_dot_type(node->src[0]);
+
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }
-                        // Workspace for tiled (see tiled.h)
-                        cur = GGML_PAD(cur, 64);
-                        cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {
@@ -2890,7 +2912,7 @@ struct ggml_cplan ggml_graph_plan(
                         const struct ggml_tensor * src0 = node->src[0];
                         const struct ggml_tensor * src1 = node->src[1];
                         const struct ggml_tensor * ids = node->src[2];
-                        const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
+                        const enum ggml_type vec_dot_type = ggml_cpu_vec_dot_type(src0);
                         const int n_as = src0->ne[2];
                         // src1
                         if (src1->type != vec_dot_type) {
@@ -2902,9 +2924,6 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
-                        // Workspace for tiled (see tiled.h)
-                        cur = GGML_PAD(cur, 64);
-                        cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
@@ -2965,13 +2984,12 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t ne10 = node->src[1]->ne[0]; // W
                         const int64_t ne11 = node->src[1]->ne[1]; // H
                         const int64_t ne12 = node->src[1]->ne[2]; // Channels In
-                        const int64_t ne13 = node->src[1]->ne[3]; // Batch
 
                         GGML_ASSERT(node->src[0]->type == GGML_TYPE_F16 || node->src[0]->type == GGML_TYPE_F32);
                         GGML_ASSERT(node->src[1]->type == GGML_TYPE_F32);
 
                         cur += ggml_type_size(node->src[0]->type) * ne00 * ne01 * ne02 * ne03;
-                        cur += ggml_type_size(node->src[0]->type) * ne10 * ne11 * ne12 * ne13;
+                        cur += ggml_type_size(node->src[0]->type) * ne10 * ne11 * ne12;
 
                     } break;
                 case GGML_OP_TOP_K:

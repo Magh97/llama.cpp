@@ -552,6 +552,99 @@ static inline __m128i get_scale_shuffle(int i) {
 }
 #endif
 
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#  define GGML_DPBUSD_256 _mm256_dpbusd_epi32
+#elif defined(__AVXVNNI__)
+#  define GGML_DPBUSD_256 _mm256_dpbusd_avx_epi32
+#endif
+
+void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_PQ2_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_pq2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0      * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+#if defined(__AVX2__)
+    // AVX2 (+AVX-VNNI / AVX-512-VNNI dot when available). 2-bit codes c in {0,1,2,3}
+    // (value = c-1); byte b of a 32-weight sub-block holds weights 4b..4b+3, LSB pair first.
+    // Group 128 = four q8_0 sub-blocks.
+    //
+    // Unpack: broadcast the 8 code bytes into all four 64-bit lanes, shift lane j right by
+    // 2j and mask with 3 -> byte [8j+b] = code of weight 4b+j (3 instructions, no
+    // per-sub-block horizontal sums, which dominated the previous kernel: 2 hsums per 32
+    // weights and a scalar float chain). The q8 activations are permuted once per sub-block
+    // to the same [8j+b] order, and the int32 partial sums stay vectorized; the block scale
+    // is applied with one FMA and there is a single horizontal sum at the very end.
+    const __m256i shifts  = _mm256_setr_epi64x(0, 2, 4, 6);
+    const __m256i mask3   = _mm256_set1_epi8(3);
+    const __m256i ones_8  = _mm256_set1_epi8(1);
+#if !defined(GGML_DPBUSD_256)
+    const __m256i ones_16 = _mm256_set1_epi16(1);
+#endif
+    // weight order [4b+j] -> code order [8j+b]: in-lane 4x4 byte transpose, then interleave
+    // the two 128-bit lanes dword-wise (lo j0, hi j0, lo j1, hi j1, ...).
+    const __m256i qy_shuf = _mm256_setr_epi8(0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15,
+                                             0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15);
+    const __m256i qy_perm = _mm256_setr_epi32(0,4,1,5,2,6,3,7);
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        __m256 acc_block = _mm256_setzero_ps();
+        for (int k = 0; k < 4; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
+            const __m256i qy  = _mm256_loadu_si256((const __m256i *) yb->qs);
+            const __m256i qyp = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(qy, qy_shuf), qy_perm);
+            int64_t xq; memcpy(&xq, &x[i].qs[k * 8], sizeof(xq));
+            const __m256i codes = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(xq), shifts), mask3);
+            // sum((c-1)*qy) = sum(c*qy) - sum(qy), per 32-bit lane (4 products each)
+#if defined(GGML_DPBUSD_256)
+            const __m256i s32 = _mm256_sub_epi32(GGML_DPBUSD_256(_mm256_setzero_si256(), codes,  qyp),
+                                                 GGML_DPBUSD_256(_mm256_setzero_si256(), ones_8, qyp));
+#else
+            const __m256i s32 = _mm256_sub_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(codes,  qyp), ones_16),
+                                                 _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, qyp), ones_16));
+#endif
+            acc_block = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb->d)), _mm256_cvtepi32_ps(s32), acc_block);
+        }
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
+    }
+    sumf = hsum_float_8(acc);
+#else
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        float sumi = 0.0f;
+        for (int k = 0; k < 4; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            int sumi_block = 0;
+            const uint8_t * GGML_RESTRICT qs = &x[i].qs[k * 8];
+            const int8_t  * GGML_RESTRICT qy = yb->qs;
+            for (int b = 0; b < 8; ++b) {
+                const uint8_t byte = qs[b];
+                sumi_block += ((int)((byte >> 0) & 3) - 1) * qy[b*4 + 0];
+                sumi_block += ((int)((byte >> 2) & 3) - 1) * qy[b*4 + 1];
+                sumi_block += ((int)((byte >> 4) & 3) - 1) * qy[b*4 + 2];
+                sumi_block += ((int)((byte >> 6) & 3) - 1) * qy[b*4 + 3];
+            }
+            sumi += d1 * sumi_block;
+        }
+        sumf += d0 * sumi;
+    }
+#endif
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK1_0;
     const int nb = n / qk;
@@ -4105,4 +4198,61 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     UNUSED(nb);
     ggml_vec_dot_iq4_xs_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
+}
+
+
+// PQ2_0 x Q8_K AVX2 / AVX-VNNI dot (tier 2, 2026-09-18). With one activation scale per 256 the four sub-block
+// dots of a 128-weight block are accumulated in int32 and scaled ONCE (4 dpbusd + 1 sub + 1 cvt + 1 fmadd per
+// 128 weights, against 4x(2 dpbusd + sub + cvt + fmadd) on the Q8_0 path). The sum(y) correction for the
+// unsigned codes is kept per lane (dpbusd(ones, y)) so the per-lane partials stay exact; the tiled GEMM in
+// llamafile/sgemm.cpp uses the same per-block float op and the same reduction, so both paths agree bit-for-bit.
+static inline __m256i pq2k_dpbusd_acc(__m256i acc, __m256i u, __m256i s) {
+#if defined(GGML_DPBUSD_256)
+    return GGML_DPBUSD_256(acc, u, s);
+#else
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1)));
+#endif
+}
+void ggml_vec_dot_pq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_pq2_0 * GGML_RESTRICT x = vx;
+    const block_q8_K  * GGML_RESTRICT y = vy;
+    const int nb = n / QK_PQ2_0;
+
+    float sumf = 0.0f;
+#if defined(__AVX2__)
+    const __m256i shifts  = _mm256_setr_epi64x(0, 2, 4, 6);
+    const __m256i mask3   = _mm256_set1_epi8(3);
+    const __m256i ones_8  = _mm256_set1_epi8(1);
+    const __m256i qy_shuf = _mm256_setr_epi8(0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15,
+                                             0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15);
+    const __m256i qy_perm = _mm256_setr_epi32(0,4,1,5,2,6,3,7);
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < nb; i++) {
+        const block_q8_K * GGML_RESTRICT yb = &y[i >> 1];
+        const int8_t * GGML_RESTRICT q8 = yb->qs + 128 * (i & 1);
+        __m256i acc_c = _mm256_setzero_si256();
+        __m256i acc_1 = _mm256_setzero_si256();
+        for (int k = 0; k < 4; k++) {
+            const __m256i qy  = _mm256_loadu_si256((const __m256i *) (q8 + 32 * k));
+            const __m256i qyp = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(qy, qy_shuf), qy_perm);
+            int64_t xq; memcpy(&xq, &x[i].qs[8 * k], sizeof(xq));
+            const __m256i codes = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(xq), shifts), mask3);
+            acc_c = pq2k_dpbusd_acc(acc_c, codes,  qyp);
+            acc_1 = pq2k_dpbusd_acc(acc_1, ones_8, qyp);
+        }
+        const __m256i s32 = _mm256_sub_epi32(acc_c, acc_1);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[i].d) * yb->d), _mm256_cvtepi32_ps(s32), acc);
+    }
+    sumf = hsum_float_8(acc);
+#else
+    ggml_vec_dot_pq2_0_q8_K_generic(n, &sumf, bs, vx, bx, vy, by, nrc);
+#endif
+    *s = sumf;
 }
