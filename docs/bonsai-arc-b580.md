@@ -245,28 +245,32 @@ export GGML_SYCL_MMVQ_CHUNK_MAX=128       # anything else up to 128 tokens as ch
 About 100 t/s on new code at temperature 0.6 too. Gemma writes slightly better code (HumanEval+ 152 vs 141 of 164) and is
 faster on new code; Bonsai is faster on edits (~255 vs 168 t/s) and renames (~370 vs 275).
 
-## Qwen 3.5 / 3.6 MoE (bonus): GQA 8:1 decode attention
+## Qwen 3.5 / 3.6 (bonus): GQA 8:1 and 4:1 decode attention
 
-Qwen 3.5-35B-A3B, Qwen 3.6-35B-A3B and their fine-tunes are hybrid GDN + MoE models with 16 query heads over
-2 KV heads (8:1) at head size 256. The q4_0 decode-attention kernels were only instantiated for GQA 6:1 (Bonsai)
-and 2:1 / 16:1 (Gemma 4), so these models ran the generic vector path and lost most of their speed as the context
-grew. They now use the same fast path (plain by default, XMX with `GGML_SYCL_FA_DEC_DPAS=1`); 5-8 token verify
-batches run as two 4-token chunks, because the v3 kernel would need ~74 KB of SLM at 8:1.
+Qwen 3.5/3.6 ship three shapes with the same attention geometry (head size 256): the 35B-A3B MoE (16 query heads
+over 2 KV heads, 8:1), the 27B dense (24 over 4, 6:1) and the 9B dense (16 over 4, 4:1). The q4_0 decode-attention
+kernels were only instantiated for 6:1 (Bonsai) and 2:1 / 16:1 (Gemma 4), so the MoE and the 9B ran the generic
+vector path and lost most of their speed as the context grew. Both now use the same fast path (plain by default, XMX
+on Xe2); at 8:1, 5-8 token verify batches run as two 4-token chunks, because the v3 kernel would need ~74 KB of SLM.
 
-Arc Pro B60 24 GB, Linux, oneAPI 2025.3, Level Zero 26.35, build `e3de229c1` (11409),
-`Qwopus3.6-35B-A3B-Coder-MTP-Q4_K_M` (20.21 GiB), q4_0 KV cache, flash attention on, all layers on the GPU,
-llama-bench `tg128`, 2 repetitions:
+Arc Pro B60 24 GB, Linux, oneAPI 2025.3, Level Zero 26.35, q4_0 KV cache, flash attention on, all layers on the
+GPU, llama-bench `tg128`, 2 repetitions:
 
-| context | before | GQA 8:1 (default) | GQA 8:1 + XMX |
-|---|---:|---:|---:|
-| 0 | 91.3 | 91.4 | 92.4 |
-| 8K | 77.2 | 85.3 (+10%) | 89.8 (+16%) |
-| 32K | 53.7 | 68.3 (+27%) | 81.2 (+51%) |
-| 128K | 24.6 | 45.5 (+85%) | 59.8 (+143%) |
+| context | 35B-A3B MoE (8:1) before | after | 9B dense (4:1) before | after |
+|---|---:|---:|---:|---:|
+| 0 | 91.3 | 92.4 | 63.7 | 64.1 |
+| 8K | 77.2 | 89.8 (+16%) | 54.0 | 62.2 (+15%) |
+| 32K | 53.7 | 81.2 (+51%) | 37.1 | 55.9 (+51%) |
+| 128K | 24.6 | 59.8 (+143%) | 16.5 | 42.2 (+156%) |
 
-Prefill is unchanged: pp512 849 t/s at 0 and 537 t/s at 128K (was 510). Greedy output is byte-identical to the
-generic path (48 tokens of single-token decode, and 96 tokens with `--spec-type ngram-simple`, which keeps the
-drafts the same so only the attention kernel differs). MTP with 3 drafts on a 256-token code answer: 53.5 -> 65.8 t/s.
+Prefill is unchanged (35B pp512 849 t/s at 0 and 537 at 128K, was 510; 9B 1,901 at 0 and 895 at 128K). MTP with
+3 drafts on a 256-token code answer: 53.5 -> 65.8 t/s.
+
+The fast kernels reorder the attention arithmetic, so greedy output matches the generic path exactly where the
+choice is clear (96 tokens of counting: byte-identical, and repeat runs are deterministic) but can flip on a
+near-tie in free-form text; the pre-existing 6:1 kernels behave the same way. The 4:1 work left the other shapes
+where they were: 27B dense 21.82 / 19.87 t/s at 0 / 32K (was 21.84 / 19.88), Bonsai 2 27B 35.97 / 31.02 (was
+36.00 / 31.04), 35B-A3B 91.2 / 90.2 / 81.4 / 59.8 at 0 / 8K / 32K / 128K.
 
 ```sh
 # XMX decode attention is on by default on Xe2 (GGML_SYCL_FA_DEC_DPAS=0 turns it off)
@@ -274,10 +278,9 @@ drafts the same so only the attention kernel differs). MTP with 3 drafts on a 25
   -c 131072 -ctk q4_0 -ctv q4_0 -fa on --spec-type draft-mtp --spec-draft-n-max 3
 ```
 
-The model leaves room for the q4_0 KV cache at 128K on a 24 GB card; at 32K decode is 81 t/s with the XMX path.
-The same kernel also helps the GQA 6:1 shapes on this card (Bonsai 2 27B at 32K: 27.4 -> 31.0 t/s; Qwen3.6-27B dense: 18.3 -> 19.9),
-declines cleanly when the cache is q8_0 (the kernel needs q4_0 K/V), and was checked with a vision model (Qwen3.8-27B + mmproj) and a
-512-token generation.
+The model leaves room for the q4_0 KV cache at 128K on a 24 GB card; at 32K decode is 81 t/s. A q8_0 KV cache
+declines the kernel cleanly (it needs q4_0 K/V); a vision model (Qwen3.8-27B + mmproj) and a 512-token generation
+were checked too.
 
 ## Switches (SYCL)
 

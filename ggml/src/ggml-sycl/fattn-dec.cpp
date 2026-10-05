@@ -1004,6 +1004,7 @@ bool ggml_sycl_flash_attn_ext_dec_supported(const ggml_tensor * dst) {
            // Bonsai 2 27B (head 256, 6 query heads per KV head); with the DPAS kernel also Gemma 4's global layers (512, 16)
            ((K->ne[0] == DEC_D && Q->ne[2] == 6 * K->ne[2]) || (maxq && K->ne[0] == 512 && Q->ne[2] == 16 * K->ne[2]) ||
             (K->ne[0] == DEC_D && Q->ne[2] == 8 * K->ne[2]) ||  // Qwen 3.6 / 3.5 MoE: 16 query heads over 2 KV heads
+            (K->ne[0] == DEC_D && Q->ne[2] == 4 * K->ne[2]) ||  // Qwen 3.5 / 3.6 9B dense: 16 query heads over 4 KV heads
             (maxq && K->ne[0] == DEC_D && Q->ne[2] == 2 * K->ne[2])) &&  // Gemma 4 sliding layers (256, 2)
            V->ne[0] == K->ne[0] && Q->ne[0] == K->ne[0] && V->ne[2] == K->ne[2] &&
            Q->ne[1] >= 1 && Q->ne[1] <= (maxq ? maxq : 4) && Q->ne[3] == K->ne[3] && V->ne[3] == K->ne[3] &&  // 5-8: TILE is faster (v3<6,8> 1172-1240 vs 1049 us @16K)
@@ -1030,6 +1031,7 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
     const bool d512 = K->ne[0] == 512;  // Gemma 4 global layers: DPAS kernel only, token chunks of 2 (16 heads x 2 rows)
     const bool g2   = !d512 && Q->ne[2] == 2 * K->ne[2];  // Gemma 4 sliding layers: DPAS kernel only, token chunks of 8
     const bool g8   = !d512 && !g2 && Q->ne[2] == 8 * K->ne[2];  // Qwen 3.6 / 3.5 MoE: 16 query heads over 2 KV heads
+    const bool g4   = !d512 && !g2 && Q->ne[2] == 4 * K->ne[2];  // Qwen 3.5 / 3.6 9B dense: 16 query heads over 4 KV heads
     const int nq   = d512 ? (ne01 <= 1 ? 1 : 2) : g2 ? (ne01 <= 1 ? 1 : 8) : ne01 <= 1 ? 1 : ne01 <= 2 ? 2 : ne01 <= 4 ? 4 : 8;
     // keys per tile (must match the instantiations below); DPAS: 16 x KG
     const int tk   = (d512 || g2) ? (nq == 1 ? 256 : 128)
@@ -1086,12 +1088,12 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
         }
 #undef FATTN_DEC_DPASG2
     } else if (dpas) {
-        // G (query heads per KV head): 6 = Bonsai 2 27B, 8 = Qwen 3.6 / 3.5 MoE
+        // G (query heads per KV head): 4 = Qwen 3.5 / 3.6 9B dense, 6 = Bonsai 2 27B, 8 = Qwen 3.6 / 3.5 MoE
         switch (nq) {
-            case 1: if (g8) { FATTN_DEC_DPAS(8, 1, 16, 1); } else { FATTN_DEC_DPAS(6, 1, 16, 1); } break;
-            case 2: if (g8) { FATTN_DEC_DPAS(8, 2, 8, 1);  } else { FATTN_DEC_DPAS(6, 2, 8, 1);  } break;
-            case 4: if (g8) { FATTN_DEC_DPAS(8, 4, 16, 3); } else { FATTN_DEC_DPAS(6, 4, 16, 3); } break;
-            default: if (g8) { FATTN_DEC_DPAS(8, 8, 8, 3); } else { FATTN_DEC_DPAS(6, 8, 8, 3); } break;  // 8-token chunks, one work-group row per chunk
+            case 1: if (g4) { FATTN_DEC_DPAS(4, 1, 16, 1); } else if (g8) { FATTN_DEC_DPAS(8, 1, 16, 1); } else { FATTN_DEC_DPAS(6, 1, 16, 1); } break;
+            case 2: if (g4) { FATTN_DEC_DPAS(4, 2, 8, 1);  } else if (g8) { FATTN_DEC_DPAS(8, 2, 8, 1);  } else { FATTN_DEC_DPAS(6, 2, 8, 1);  } break;
+            case 4: if (g4) { FATTN_DEC_DPAS(4, 4, 16, 3); } else if (g8) { FATTN_DEC_DPAS(8, 4, 16, 3); } else { FATTN_DEC_DPAS(6, 4, 16, 3); } break;
+            default: if (g4) { FATTN_DEC_DPAS(4, 8, 8, 3); } else if (g8) { FATTN_DEC_DPAS(8, 8, 8, 3); } else { FATTN_DEC_DPAS(6, 8, 8, 3); } break;  // 8-token chunks, one work-group row per chunk
         }
     }
 #undef FATTN_DEC_DPAS
@@ -1099,18 +1101,21 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
         mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11, (int) K->ne[2],           \
         (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], nb31,    \
         nb33, ne33, nsplit, chunk, stream)
+#define FATTN_DEC_V3(G_, NQ_) fattn_dec_q4_0_v3<G_, NQ_>((const char *) Q->data, (const char *) K->data, (const char *) V->data, mdata, \
+        (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11, (int) K->ne[2],                          \
+        (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],                 \
+        nb31, nb33, ne33, nsplit, chunk, stream)
+    // G (query heads per KV head): 4 = Qwen 3.5 / 3.6 9B dense, 6 = Bonsai 2 27B, 8 = Qwen 3.6 / 3.5 MoE
     if (!dpas && !d512 && !g2) switch (nq) {
-        case 1: if (g8) { FATTN_DEC_CALL(8, 1); } else { FATTN_DEC_CALL(6, 1); } break;
-        case 2: if (g8) { FATTN_DEC_CALL(8, 2); } else { FATTN_DEC_CALL(6, 2); } break;
-        case 8:  // 5-8 tokens (MTP depth 4+, short n-gram drafts): v3 kernel, 48 rows, 32-key tiles, ~59 KB SLM
+        case 1: if (g4) { FATTN_DEC_CALL(4, 1); } else if (g8) { FATTN_DEC_CALL(8, 1); } else { FATTN_DEC_CALL(6, 1); } break;
+        case 2: if (g4) { FATTN_DEC_CALL(4, 2); } else if (g8) { FATTN_DEC_CALL(8, 2); } else { FATTN_DEC_CALL(6, 2); } break;
+        case 8:  // 5-8 tokens (MTP depth 4+, short n-gram drafts): v3 kernel, 32-key tiles
+            if (g4) { FATTN_DEC_V3(4, 8); break; }  // 32 rows
             if (g8) {  // G=8 is 64 rows: v3<8, 8> would need ~74 KB SLM, so run two 4-token chunks
                 FATTN_DEC_CALL(8, 4);
                 break;
             }
-            fattn_dec_q4_0_v3<6, 8>((const char *) Q->data, (const char *) K->data, (const char *) V->data, mdata,
-                (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11, (int) K->ne[2],
-                (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-                nb31, nb33, ne33, nsplit, chunk, stream);
+            FATTN_DEC_V3(6, 8);  // 48 rows, ~59 KB SLM
             break;
         default:
             if (static const int xmx = getenv("GGML_SYCL_FA_DEC_XMX") ? atoi(getenv("GGML_SYCL_FA_DEC_XMX")) : 0; xmx) {  // ARC-LAB opt-in
@@ -1119,27 +1124,18 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
                     (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],      \
                     nb31, nb33, ne33, nsplit, chunk, stream)
                 if (xmx == 32) {
-                    if (g8) { FATTN_DEC_XMX(8, 32); } else { FATTN_DEC_XMX(6, 32); }
+                    if (g4) { FATTN_DEC_XMX(4, 32); } else if (g8) { FATTN_DEC_XMX(8, 32); } else { FATTN_DEC_XMX(6, 32); }
                 } else {
-                    if (g8) { FATTN_DEC_XMX(8, 64); } else { FATTN_DEC_XMX(6, 64); }
+                    if (g4) { FATTN_DEC_XMX(4, 64); } else if (g8) { FATTN_DEC_XMX(8, 64); } else { FATTN_DEC_XMX(6, 64); }
                 }
 #undef FATTN_DEC_XMX
                 break;
             }
-            if (g8) {
-                fattn_dec_q4_0_v3<8, 4>((const char *) Q->data, (const char *) K->data, (const char *) V->data, mdata,
-                    (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11, (int) K->ne[2],
-                    (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-                    nb31, nb33, ne33, nsplit, chunk, stream);
-            } else {
-                fattn_dec_q4_0_v3<6, 4>((const char *) Q->data, (const char *) K->data, (const char *) V->data, mdata,
-                    (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11, (int) K->ne[2],
-                    (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
-                    nb31, nb33, ne33, nsplit, chunk, stream);
-            }
+            if (g4) { FATTN_DEC_V3(4, 4); } else if (g8) { FATTN_DEC_V3(8, 4); } else { FATTN_DEC_V3(6, 4); }
             break;
     }
 #undef FATTN_DEC_CALL
+#undef FATTN_DEC_V3
 
     if (nsplit > 1) {
         auto combine = [&](auto dk) {
