@@ -263,8 +263,8 @@ GPU, llama-bench `tg128`, 2 repetitions:
 | 32K | 53.7 | 81.2 (+51%) | 37.1 | 55.9 (+51%) |
 | 128K | 24.6 | 59.8 (+143%) | 16.5 | 42.2 (+156%) |
 
-Prefill is unchanged (35B pp512 849 t/s at 0 and 537 at 128K, was 510; 9B 1,901 at 0 and 895 at 128K). MTP with
-3 drafts on a 256-token code answer: 53.5 -> 65.8 t/s.
+Prefill is unchanged (35B pp512 849 t/s at 0 and 537 at 128K, was 510; 9B 1,901 at 0 and 895 at 128K). Speculative
+decoding is now its own trade-off - see "Speculative decoding (MTP) after the faster decode" below.
 
 The fast kernels reorder the attention arithmetic, so greedy output matches the generic path exactly where the
 choice is clear (96 tokens of counting: byte-identical, and repeat runs are deterministic) but can flip on a
@@ -275,9 +275,7 @@ where they were: 27B dense 21.82 / 19.87 t/s at 0 / 32K (was 21.84 / 19.88), Bon
 The rest of the family behaves the same at 32K (before -> after, 1 repetition): Qwen3.5-9B 36.4 -> 54.4,
 Qwen3.8-9B 37.1 -> 55.9, MiMo 9B 35.0 -> 51.2, Ornith/Qwopus 9B MTP 37.1 -> 56.0, gmcoder Q8_0 21.1 -> 26.0,
 NeoHorse 4B 28.2 -> 37.7; the 27B dense line goes 8.6..10.2 -> 12.1..15.7, and the lowest-bit quants gain the most
-(Bonsai Q1_0 10.2 -> 15.7, Ternary PQ2_0 14.8 -> 29.9). MTP wants a shallower draft on the 9B: 3 drafts cost 12%
-there (61.9 -> 54.5 t/s on a 256-token code answer) while 1 draft gains 8.7% (-> 67.3); the 35B-A3B still likes 3
-(53.5 -> 65.8).
+(Bonsai Q1_0 10.2 -> 15.7, Ternary PQ2_0 14.8 -> 29.9).
 
 ```sh
 # XMX decode attention is on by default on Xe2 (GGML_SYCL_FA_DEC_DPAS=0 turns it off)
@@ -366,6 +364,25 @@ sliding layers of Gemma 4 are capped by their window (4 tiles) and are unaffecte
 (35B pp512 @32K 745 -> 662, @128K 510 -> 494; Ornith-1.5-9B 1481 -> 1346, 895 -> 848).
 
 To reproduce the before/after on another card: `benches/arc-decode-attention/run.sh <model.gguf>`.
+
+### Speculative decoding (MTP) after the faster decode
+
+The faster the base decode, the less drafting pays. On a 256-token code answer (llama-cli `Generation:`, greedy,
+same prompt and seed), t/s:
+
+| model | no drafts | 1 | 2 | 3 | 4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 35B-A3B MoE | **70.1** | 57.4 | 57.4 | 54.9 | 41.4 |
+| Ornith-1.5-9B | 63.1 | **67.6** | 61.7 | 54.7 | 48.9 |
+| Qwen3.6-27B dense | 21.7 | 28.2 | **29.2** | 28.4 | 26.9 |
+| Kwaipilot KAT MoE | **62.6** | 42.9 | 47.6 | 45.2 | 44.0 |
+
+Drafts still pay on the bandwidth-bound dense 27B (+35% at 2) and slightly on the 9B (+7% at 1); they cost the
+35B-A3B and the KAT MoE 20-30%, which are fast enough without them now. The earlier "+23% for the 35B-A3B" was
+measured against the slower pre-8:1 decode and no longer applies.
+
+The 4-token verify batch (MTP depth 3) has its own kernel choice: `GGML_SYCL_FA_DEC_DPAS=0 GGML_SYCL_FA_DEC_XMX=32`
+beats the default DPAS on the 9B (57.9 vs 54.9 t/s) and is level on the 35B (54.7 vs 54.4); XMX stays opt-in.
 
 ## Switches (SYCL)
 
