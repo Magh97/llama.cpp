@@ -970,12 +970,15 @@ static void fattn_dec_q4_0_dpas(const char * Q, const char * K, const char * V, 
 static int fattn_dec_dpas_maxq() {  // 0 = DPAS kernel off; else it serves 1 .. maxq query tokens
     static const int v = [] {
         const char * e = getenv("GGML_SYCL_FA_DEC_DPAS");
-        int          n = e ? atoi(e) : 0;
+        const bool   explicit_env = e != nullptr;
+        int          n = e ? atoi(e) : 1;  // on by default on Xe2; GGML_SYCL_FA_DEC_DPAS=0 turns it off
         // the kernel needs Xe2's 16-lane int8 x int4 DPAS; elsewhere fall back instead of failing at the first launch
         if (n && !getenv("GGML_SYCL_FA_DEC_DPAS_ANYGPU") && !ggml_sycl_device_is_xe2()) {
-            GGML_LOG_WARN("%s: GGML_SYCL_FA_DEC_DPAS needs an Xe2 or newer GPU (Arc B-series, Lunar Lake, Panther Lake); "
-                          "%s is not one, using the regular decode attention\n", __func__,
-                          ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info.name.c_str());
+            if (explicit_env) {
+                GGML_LOG_WARN("%s: GGML_SYCL_FA_DEC_DPAS needs an Xe2 or newer GPU (Arc B-series, Lunar Lake, Panther Lake); "
+                              "%s is not one, using the regular decode attention\n", __func__,
+                              ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info.name.c_str());
+            }
             n = 0;
         }
         return n;

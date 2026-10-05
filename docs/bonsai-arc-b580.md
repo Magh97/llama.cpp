@@ -269,21 +269,24 @@ generic path (48 tokens of single-token decode, and 96 tokens with `--spec-type 
 drafts the same so only the attention kernel differs). MTP with 3 drafts on a 256-token code answer: 53.5 -> 65.8 t/s.
 
 ```sh
-export GGML_SYCL_FA_DEC_DPAS=1     # XMX decode attention, now also the Qwen 3.5 / 3.6 MoE shapes
+# XMX decode attention is on by default on Xe2 (GGML_SYCL_FA_DEC_DPAS=0 turns it off)
 ./build-sycl/bin/llama-server -m Qwopus3.6-35B-A3B-Coder-MTP-Q4_K_M.gguf -ngl 99 \
   -c 131072 -ctk q4_0 -ctv q4_0 -fa on --spec-type draft-mtp --spec-draft-n-max 3
 ```
 
 The model leaves room for the q4_0 KV cache at 128K on a 24 GB card; at 32K decode is 81 t/s with the XMX path.
+The same kernel also helps the GQA 6:1 shapes on this card (Bonsai 2 27B at 32K: 27.4 -> 31.0 t/s; Qwen3.6-27B dense: 18.3 -> 19.9),
+declines cleanly when the cache is q8_0 (the kernel needs q4_0 K/V), and was checked with a vision model (Qwen3.8-27B + mmproj) and a
+512-token generation.
 
 ## Switches (SYCL)
 
-All optimisations are on by default except the XMX path. The XMX path needs an Xe2 or newer GPU (Arc B-series, Lunar Lake, Panther Lake); on
-others it turns itself off with a warning. Set any of these to turn a piece off for comparison:
+All optimisations are on by default, including the XMX decode attention on an Xe2 or newer GPU (Arc B-series, Lunar Lake,
+Panther Lake); on other GPUs it turns itself off. Set any of these to turn a piece off for comparison:
 `GGML_SYCL_PTQ1_T2_GEMM_OFF`, `GGML_SYCL_PTQ1_MULTI=0`, `GGML_SYCL_PTQ1_MULTI_NCOLS=0`, `GGML_SYCL_PTQ1_GLU1=0`,
 `GGML_SYCL_PTQ1_PAIRS=0`, `GGML_SYCL_PTQ1_NCOLS_DEC_OFF`, `GGML_SYCL_FA_DEC_OFF`, `GGML_SYCL_GDN_BLOCKED_OFF`,
-`GGML_SYCL_GLU_FUSE_OFF`, `GGML_SYCL_TOPK_OLD=1`. Opt-in: `GGML_SYCL_FA_DEC_DPAS=1` (XMX decode attention, Xe2; also covers the Qwen 3.5 / 3.6 MoE 8:1 shapes),
-`GGML_SYCL_MMVQ_CHUNK_MAX=N` (largest quantized batch run as chunked mat-vecs, default 32), `GGML_SYCL_Q4_0_DPAS=1`
+`GGML_SYCL_GLU_FUSE_OFF`, `GGML_SYCL_TOPK_OLD=1`, `GGML_SYCL_FA_DEC_DPAS=0` (XMX decode attention; `=1` forces the 32-token cap).
+Opt-in: `GGML_SYCL_MMVQ_CHUNK_MAX=N` (largest quantized batch run as chunked mat-vecs, default 32), `GGML_SYCL_Q4_0_DPAS=1`
 (q4_0 verify batches on XMX, Xe2), `GGML_SYCL_T2_W8A8_MIN=N` (prompt batches of N+ tokens via oneDNN int8, 0 = off). An MTP GGUF can carry a
 trimmed draft LM head (`blk.<n>.nextn.draft_head`, top-K frequent tokens; ~5% faster drafting on the B580);
 `LLAMA_MTP_DRAFT_HEAD_OFF=1` ignores it.
