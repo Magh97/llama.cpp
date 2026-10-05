@@ -245,13 +245,44 @@ export GGML_SYCL_MMVQ_CHUNK_MAX=128       # anything else up to 128 tokens as ch
 About 100 t/s on new code at temperature 0.6 too. Gemma writes slightly better code (HumanEval+ 152 vs 141 of 164) and is
 faster on new code; Bonsai is faster on edits (~255 vs 168 t/s) and renames (~370 vs 275).
 
+## Qwen 3.5 / 3.6 MoE (bonus): GQA 8:1 decode attention
+
+Qwen 3.5-35B-A3B, Qwen 3.6-35B-A3B and their fine-tunes are hybrid GDN + MoE models with 16 query heads over
+2 KV heads (8:1) at head size 256. The q4_0 decode-attention kernels were only instantiated for GQA 6:1 (Bonsai)
+and 2:1 / 16:1 (Gemma 4), so these models ran the generic vector path and lost most of their speed as the context
+grew. They now use the same fast path (plain by default, XMX with `GGML_SYCL_FA_DEC_DPAS=1`); 5-8 token verify
+batches run as two 4-token chunks, because the v3 kernel would need ~74 KB of SLM at 8:1.
+
+Arc Pro B60 24 GB, Linux, oneAPI 2025.3, Level Zero 26.35, build `e3de229c1` (11409),
+`Qwopus3.6-35B-A3B-Coder-MTP-Q4_K_M` (20.21 GiB), q4_0 KV cache, flash attention on, all layers on the GPU,
+llama-bench `tg128`, 2 repetitions:
+
+| context | before | GQA 8:1 (default) | GQA 8:1 + XMX |
+|---|---:|---:|---:|
+| 0 | 91.3 | 91.4 | 92.4 |
+| 8K | 77.2 | 85.3 (+10%) | 89.8 (+16%) |
+| 32K | 53.7 | 68.3 (+27%) | 81.2 (+51%) |
+| 128K | 24.6 | 45.5 (+85%) | 59.8 (+143%) |
+
+Prefill is unchanged: pp512 849 t/s at 0 and 537 t/s at 128K (was 510). Greedy output is byte-identical to the
+generic path (48 tokens of single-token decode, and 96 tokens with `--spec-type ngram-simple`, which keeps the
+drafts the same so only the attention kernel differs). MTP with 3 drafts on a 256-token code answer: 53.5 -> 65.8 t/s.
+
+```sh
+export GGML_SYCL_FA_DEC_DPAS=1     # XMX decode attention, now also the Qwen 3.5 / 3.6 MoE shapes
+./build-sycl/bin/llama-server -m Qwopus3.6-35B-A3B-Coder-MTP-Q4_K_M.gguf -ngl 99 \
+  -c 131072 -ctk q4_0 -ctv q4_0 -fa on --spec-type draft-mtp --spec-draft-n-max 3
+```
+
+The model leaves room for the q4_0 KV cache at 128K on a 24 GB card; at 32K decode is 81 t/s with the XMX path.
+
 ## Switches (SYCL)
 
 All optimisations are on by default except the XMX path. The XMX path needs an Xe2 or newer GPU (Arc B-series, Lunar Lake, Panther Lake); on
 others it turns itself off with a warning. Set any of these to turn a piece off for comparison:
 `GGML_SYCL_PTQ1_T2_GEMM_OFF`, `GGML_SYCL_PTQ1_MULTI=0`, `GGML_SYCL_PTQ1_MULTI_NCOLS=0`, `GGML_SYCL_PTQ1_GLU1=0`,
 `GGML_SYCL_PTQ1_PAIRS=0`, `GGML_SYCL_PTQ1_NCOLS_DEC_OFF`, `GGML_SYCL_FA_DEC_OFF`, `GGML_SYCL_GDN_BLOCKED_OFF`,
-`GGML_SYCL_GLU_FUSE_OFF`, `GGML_SYCL_TOPK_OLD=1`. Opt-in: `GGML_SYCL_FA_DEC_DPAS=1` (XMX decode attention, Xe2),
+`GGML_SYCL_GLU_FUSE_OFF`, `GGML_SYCL_TOPK_OLD=1`. Opt-in: `GGML_SYCL_FA_DEC_DPAS=1` (XMX decode attention, Xe2; also covers the Qwen 3.5 / 3.6 MoE 8:1 shapes),
 `GGML_SYCL_MMVQ_CHUNK_MAX=N` (largest quantized batch run as chunked mat-vecs, default 32), `GGML_SYCL_Q4_0_DPAS=1`
 (q4_0 verify batches on XMX, Xe2), `GGML_SYCL_T2_W8A8_MIN=N` (prompt batches of N+ tokens via oneDNN int8, 0 = off). An MTP GGUF can carry a
 trimmed draft LM head (`blk.<n>.nextn.draft_head`, top-K frequent tokens; ~5% faster drafting on the B580);
