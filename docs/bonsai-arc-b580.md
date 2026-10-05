@@ -289,6 +289,63 @@ The model leaves room for the q4_0 KV cache at 128K on a 24 GB card; at 32K deco
 declines the kernel cleanly (it needs q4_0 K/V); a vision model (Qwen3.8-27B + mmproj) and a 512-token generation
 were checked too.
 
+### All measured models (Arc Pro B60, 32K, 1 repetition)
+
+`tg128`, q4_0 KV cache, flash attention on, all layers on the GPU. "before" is `GGML_SYCL_FA_DEC_OFF=1` (the
+generic vector path these models used before this work), "after" is the current default.
+
+**MoE, GQA 8:1 (16 query heads / 2 KV), head 256**
+
+| model | before | after | |
+|---|---:|---:|---:|
+| Qwopus3.6-35B-A3B-Coder-MTP Q4_K_M | 53.7 | 81.2 | +51% |
+| Ornith-1.5-35B Q4_K_M | 53.6 | 80.8 | +51% |
+| KAT-Coder-V2.5-Dev-APEX-Quality | 48.9 | 70.7 | +45% |
+| KAT-Coder-V2.5-Dev-APEX-I-Mini | 43.2 | 59.0 | +37% |
+| Kwaipilot KAT-Coder-V2.5-Dev-MTP-APEX-I-Mini | 43.2 | 58.9 | +36% |
+| KAT-Coder-V2.5-Dev-APEX-Compact | 42.0 | 56.5 | +35% |
+
+**Dense, GQA 4:1 (16 / 4), head 256**
+
+| model | before | after | |
+|---|---:|---:|---:|
+| Ornith-1.5-9B Q4_K_M | 37.1 | 55.9 | +51% |
+| Qwen3.8-9B Q4_K_M | 37.1 | 55.9 | +51% |
+| Ornith-1.5-9B-MTP Q4_K_M | 37.1 | 56.0 | +51% |
+| Qwopus3.5-9B-Coder-MTP Q4_K_M | 37.1 | 55.9 | +51% |
+| Qwen3.5-9B Q4_K_M | 36.4 | 54.4 | +49% |
+| MiMo-V2.6-Distill-Qwen-9B Q4_K_M | 35.0 | 51.2 | +46% |
+| NeoHorse-1-4B BF16 | 28.2 | 37.7 | +34% |
+| gmcoder Q8_0 | 21.1 | 26.0 | +24% |
+
+**Dense, GQA 6:1 (24 / 4), head 256**
+
+| model | before | after | |
+|---|---:|---:|---:|
+| Ternary-Bonsai-2-27B PQ2_0 | 14.8 | 29.9 | +102% |
+| Qwen3.8-27B Q4_K_M | 12.1 | 20.5 | +70% |
+| Qwopus3.6-27B-Coder-Compat-MTP Q4_K_M | 12.1 | 20.5 | +70% |
+| Bonsai-27B Q1_0 | 10.2 | 15.7 | +53% |
+| Dirk-Qwen3.8-27B UD-Q4_K_XL | 10.1 | 15.3 | +52% |
+| Qwen3.8-27B UD-Q4_K_S | 8.9 | 12.8 | +44% |
+| Jack-3.8-27B-Coder-16GB-VRAM | 8.6 | 12.1 | +41% |
+
+**Gemma 4 12B (XMX-only shapes: global head 512 / 16:1, sliding head 256 / 2:1)**
+
+| model | before | after | |
+|---|---:|---:|---:|
+| Gemma 4 12B Q4_K_M | 25.8 | 38.6 | +50% |
+
+**Unaffected (shape not served by the kernel)**
+
+| model | before | after | |
+|---|---:|---:|---:|
+| LFM2.5-2.6B Q4_K_M (lfm2, head 64) | 88.2 | 88.2 | 0% |
+
+Same shape as a measured model, so not listed: MiMo 9B Q5/Q8/MTP, Ornith-9B-MTP Q8, Qwopus3.5-9B-v3/-Exp,
+LFM2.5-VL-3B, Ternary-Bonsai-2-27B PTQ1_0 (plain vs XMX: 35.8 / 27.4 -> 36.0 / 31.0), Qwen3.6-27B
+(22.6 / 20.5 at 0 / 32K).
+
 ## Switches (SYCL)
 
 All optimisations are on by default, including the XMX decode attention on an Xe2 or newer GPU (Arc B-series, Lunar Lake,
