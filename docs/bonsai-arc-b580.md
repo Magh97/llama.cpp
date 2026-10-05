@@ -272,6 +272,13 @@ near-tie in free-form text; the pre-existing 6:1 kernels behave the same way. Th
 where they were: 27B dense 21.82 / 19.87 t/s at 0 / 32K (was 21.84 / 19.88), Bonsai 2 27B 35.97 / 31.02 (was
 36.00 / 31.04), 35B-A3B 91.2 / 90.2 / 81.4 / 59.8 at 0 / 8K / 32K / 128K.
 
+The rest of the family behaves the same at 32K (before -> after, 1 repetition): Qwen3.5-9B 36.4 -> 54.4,
+Qwen3.8-9B 37.1 -> 55.9, MiMo 9B 35.0 -> 51.2, Ornith/Qwopus 9B MTP 37.1 -> 56.0, gmcoder Q8_0 21.1 -> 26.0,
+NeoHorse 4B 28.2 -> 37.7; the 27B dense line goes 8.6..10.2 -> 12.1..15.7, and the lowest-bit quants gain the most
+(Bonsai Q1_0 10.2 -> 15.7, Ternary PQ2_0 14.8 -> 29.9). MTP wants a shallower draft on the 9B: 3 drafts cost 12%
+there (61.9 -> 54.5 t/s on a 256-token code answer) while 1 draft gains 8.7% (-> 67.3); the 35B-A3B still likes 3
+(53.5 -> 65.8).
+
 ```sh
 # XMX decode attention is on by default on Xe2 (GGML_SYCL_FA_DEC_DPAS=0 turns it off)
 ./build-sycl/bin/llama-server -m Qwopus3.6-35B-A3B-Coder-MTP-Q4_K_M.gguf -ngl 99 \
