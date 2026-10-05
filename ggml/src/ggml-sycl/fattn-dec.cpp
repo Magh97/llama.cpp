@@ -1040,9 +1040,10 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
                    : nq == 8 ? 32 : nq == 4 ? 64 : 128;
     const int ne11 = K->ne[1];
 
-    // slices: enough work-groups to fill the GPU (~64 slices per KV head, ~256 in all), at least one tile each
+    // slices: ~64 work-groups in all (nsplit x KV heads) measured fastest on Battlemage at 32K and 128K - more
+    // splits only add combine work. GGML_SYCL_FA_DEC_SPLITS overrides the target for other cards.
     static const int target_env = getenv("GGML_SYCL_FA_DEC_SPLITS") ? atoi(getenv("GGML_SYCL_FA_DEC_SPLITS")) : 0;
-    const int target = target_env ? target_env : std::max(64, 256 / std::max(1, (int) K->ne[2]));
+    const int target = target_env ? target_env : std::max(4, 64 / std::max(1, (int) K->ne[2]));
     const int ntiles = (ne11 + tk - 1) / tk;
     int nsplit       = std::max(1, std::min(target, ntiles));
     const int chunk  = ((ntiles + nsplit - 1) / nsplit) * tk;

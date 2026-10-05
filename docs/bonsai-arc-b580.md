@@ -346,6 +346,27 @@ Same shape as a measured model, so not listed: MiMo 9B Q5/Q8/MTP, Ornith-9B-MTP 
 LFM2.5-VL-3B, Ternary-Bonsai-2-27B PTQ1_0 (plain vs XMX: 35.8 / 27.4 -> 36.0 / 31.0), Qwen3.6-27B
 (22.6 / 20.5 at 0 / 32K).
 
+### Decode splits, and the GDN chunked prefill
+
+The decode kernel split the KV range across ~256 work-groups (64 per KV head). On the B60 fewer work-groups are
+faster - more splits only add combine work - and ~64 in all (`64 / KV heads`) is the optimum on every shape:
+
+| model | depth | 256 work-groups | 64 work-groups |
+|---|---:|---:|---:|
+| 35B-A3B MoE | 32K | 81.2 | 83.8 |
+| 35B-A3B MoE | 128K | 59.8 | 67.8 (+13%) |
+| Ornith-1.5-9B | 32K | 55.9 | 58.1 |
+| Ornith-1.5-9B | 128K | 42.2 | 46.4 (+10%) |
+| Gemma 4 12B | 32K | 39.0 | 39.5 |
+
+The default is now `max(4, 64 / KV heads)`; `GGML_SYCL_FA_DEC_SPLITS=N` overrides it for other cards. The
+sliding layers of Gemma 4 are capped by their window (4 tiles) and are unaffected.
+
+`GGML_SYCL_GDN_CHUNKED=1` stays off: on the B60 it is slower for prompt processing, not faster
+(35B pp512 @32K 745 -> 662, @128K 510 -> 494; Ornith-1.5-9B 1481 -> 1346, 895 -> 848).
+
+To reproduce the before/after on another card: `benches/arc-decode-attention/run.sh <model.gguf>`.
+
 ## Switches (SYCL)
 
 All optimisations are on by default, including the XMX decode attention on an Xe2 or newer GPU (Arc B-series, Lunar Lake,
@@ -362,7 +383,7 @@ trimmed draft LM head (`blk.<n>.nextn.draft_head`, top-K frequent tokens; ~5% fa
 
 If you run this on a B580 or another Arc card, please post your results (card, driver, context, the numbers you get) in
 this repository's Discussions, and report problems as issues. Results from other setups are the most useful thing
-right now.
+right now. `benches/arc-decode-attention/run.sh` prints the decode-attention before/after for a model in one command.
 
 ## Credits
 
