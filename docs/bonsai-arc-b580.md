@@ -403,6 +403,15 @@ measured against the slower pre-8:1 decode and no longer applies.
 The 4-token verify batch (MTP depth 3) has its own kernel choice: `GGML_SYCL_FA_DEC_DPAS=0 GGML_SYCL_FA_DEC_XMX=32`
 beats the default DPAS on the 9B (57.9 vs 54.9 t/s) and is level on the 35B (54.7 vs 54.4); XMX stays opt-in.
 
+## Expert placement (next step)
+
+MoE routing is skewed: on `Qwopus3.6-35B-A3B` (40 layers, 256 experts, 8 active per token) the hottest 25% of
+experts serve 81% of the activations, and the hottest 50% serve 93.6% (8,192 tokens of code, measured with
+`tools/expert-profile`). Keeping those experts on the GPU and the rest in RAM therefore leaves the CPU far
+less work than `--n-cpu-moe`, which moves whole layers' experts: 19% against 75% at the same 25% VRAM budget.
+The profiler is in `tools/expert-profile/`; per-expert placement and the `build_moe_ffn` split are the next
+step.
+
 ## Switches (SYCL)
 
 All optimisations are on by default, including the XMX decode attention on an Xe2 or newer GPU (Arc B-series, Lunar Lake,
