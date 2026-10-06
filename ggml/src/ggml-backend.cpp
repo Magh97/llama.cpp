@@ -1733,7 +1733,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
-                                GGML_ASSERT(id >= 0 && id < n_expert);
+                                GGML_ASSERT(id < n_expert);
+                                if (id < 0) {
+                                    // -1: the expert is not on this side of a hot/cold split, nothing to prefetch
+                                    continue;
+                                }
                                 ggml_bitset_set(used_ids.data(), id);
                             }
                         }

@@ -26,6 +26,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <fstream>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -2067,8 +2068,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        // the hot/cold expert split reads the cold experts from the file, so it runs while the mappings are alive
-        create_expert_splits(ml);
+        // the hot/cold expert split reads the cold experts from the file, so it runs while the mappings are
+        // alive. Skipped for a measuring pass (no_alloc): the tensors have no buffers there.
+        if (!params.no_alloc) {
+            create_expert_splits(ml);
+        }
 
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
@@ -2238,7 +2242,56 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
-// experts kept on the GPU when GGML_EXPERT_SPLIT=N is set (0 = no split)
+// reads an expert profile written by tools/expert-profile (an "EXPR" file) and returns, per layer, the expert
+// ids sorted by how often the router picked them (most used first). Empty when no profile is configured.
+static std::vector<std::vector<int32_t>> load_expert_profile(int64_t n_expert) {
+    std::vector<std::vector<int32_t>> out;
+
+    const char * path = getenv("GGML_EXPERT_PROFILE");
+    if (path == nullptr) {
+        return out;
+    }
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        throw std::runtime_error(format("expert profile: cannot open '%s'", path));
+    }
+
+    char magic[4];
+    uint32_t version = 0, n_layer = 0, n_exp = 0;
+    uint64_t n_tokens = 0;
+    f.read(magic, 4);
+    f.read((char *) &version, 4);
+    f.read((char *) &n_layer, 4);
+    f.read((char *) &n_exp, 4);
+    f.read((char *) &n_tokens, 8);
+    if (!f || memcmp(magic, "EXPR", 4) != 0 || version != 1) {
+        throw std::runtime_error(format("expert profile '%s' is not a version-1 EXPR file", path));
+    }
+    if ((int64_t) n_exp != n_expert) {
+        throw std::runtime_error(format("expert profile '%s' has %u experts, the model has %lld", path, n_exp, (long long) n_expert));
+    }
+
+    out.resize(n_layer);
+    std::vector<uint64_t> counts(n_exp);
+    for (uint32_t l = 0; l < n_layer; l++) {
+        f.read((char *) counts.data(), (std::streamsize) (counts.size()*sizeof(uint64_t)));
+        if (!f) {
+            throw std::runtime_error(format("expert profile '%s' ends after %u layers", path, l));
+        }
+        std::vector<int32_t> order(n_exp);
+        for (uint32_t e = 0; e < n_exp; e++) {
+            order[e] = (int32_t) e;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return counts[a] > counts[b]; });
+        out[l] = std::move(order);
+    }
+
+    LLAMA_LOG_INFO("%s: expert profile '%s': %u layers, %u experts, %llu tokens\n",
+            __func__, path, n_layer, n_exp, (unsigned long long) n_tokens);
+    return out;
+}
+
 // experts kept on the GPU when GGML_EXPERT_SPLIT=N is set (0 = no split)
 static int64_t expert_split_hot_env() {
     const char * env = getenv("GGML_EXPERT_SPLIT");
@@ -2264,6 +2317,7 @@ void llama_model::create_expert_splits(llama_model_loader & ml) {
     moe_splits.assign(layers.size(), {});
 
     const int64_t n_expert = (int64_t) hparams.n_expert;
+    const std::vector<std::vector<int32_t>> profile = load_expert_profile(n_expert);
     if (n_expert <= hot_count) {
         return;
     }
@@ -2297,6 +2351,35 @@ void llama_model::create_expert_splits(llama_model_loader & ml) {
             return ggml_new_tensor_3d(ctx_cpu.get(), hot->type, hot->ne[0], hot->ne[1], cold_count);
         };
 
+        // the hot set: the profile's most-used experts, or the first N when no profile is given
+        std::vector<int32_t> hot_list(hot_count);
+        if (!profile.empty()) {
+            const std::vector<int32_t> & order = profile[il];
+            if ((int64_t) order.size() != n_expert) {
+                throw std::runtime_error(format("expert profile: layer %zu has %zu experts, expected %lld",
+                        il, order.size(), (long long) n_expert));
+            }
+            std::copy(order.begin(), order.begin() + hot_count, hot_list.begin());
+        } else {
+            for (int64_t e = 0; e < hot_count; e++) {
+                hot_list[e] = (int32_t) e;
+            }
+        }
+
+        std::vector<int32_t> cold_list;
+        cold_list.reserve(cold_count);
+        {
+            std::vector<char> is_hot(n_expert, 0);
+            for (const int32_t e : hot_list) {
+                is_hot[e] = 1;
+            }
+            for (int64_t e = 0; e < n_expert; e++) {
+                if (!is_hot[e]) {
+                    cold_list.push_back((int32_t) e);
+                }
+            }
+        }
+
         llm_moe_split & split = moe_splits[il];
 
         split.up_cold      = make_cold(l.ffn_up_exps);
@@ -2315,8 +2398,9 @@ void llama_model::create_expert_splits(llama_model_loader & ml) {
         ggml_backend_buffer_set_usage(buf_cpu.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         ggml_backend_buffer_set_usage(buf_hot.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-        // fill the cold experts from the file (the hot prefix was filled by the loader)
-        auto fill_cold = [&](ggml_tensor * hot, ggml_tensor * cold) {
+        // fill a part from the file. The loader already filled the hot tensor with the first N experts (that is
+        // what its size covers), so the hot set is written again here whenever the profile reorders it.
+        auto fill_part = [&](ggml_tensor * hot, ggml_tensor * part, const std::vector<int32_t> & list) {
             if (hot == nullptr) {
                 return;
             }
@@ -2326,22 +2410,25 @@ void llama_model::create_expert_splits(llama_model_loader & ml) {
             }
             const size_t slab = hot->nb[2];  // one expert's bytes
             std::vector<char> tmp(slab);
-            for (int64_t e = hot_count; e < n_expert; e++) {
-                const void * src = ml.load_data_range_raw(it->second, (size_t) e*slab, slab, tmp.data());
-                ggml_backend_tensor_set(cold, src, (size_t) (e - hot_count)*slab, slab);
+            for (size_t i = 0; i < list.size(); i++) {
+                const void * src = ml.load_data_range_raw(it->second, (size_t) list[i]*slab, slab, tmp.data());
+                ggml_backend_tensor_set(part, src, i*slab, slab);
             }
         };
 
-        fill_cold(l.ffn_up_exps,      split.up_cold);
-        fill_cold(l.ffn_gate_exps,    split.gate_cold);
-        fill_cold(l.ffn_down_exps,    split.down_cold);
-        fill_cold(l.ffn_gate_up_exps, split.gate_up_cold);
+        fill_part(l.ffn_up_exps,      l.ffn_up_exps,      hot_list);
+        fill_part(l.ffn_gate_exps,    l.ffn_gate_exps,    hot_list);
+        fill_part(l.ffn_down_exps,    l.ffn_down_exps,    hot_list);
+        fill_part(l.ffn_gate_up_exps, l.ffn_gate_up_exps, hot_list);
 
-        std::vector<float> hm(n_expert), cm(n_expert);
-        for (int64_t e = 0; e < n_expert; e++) {
-            hm[e] = e < hot_count ? (float) e : -1.0f;
-            cm[e] = e < hot_count ? -1.0f : (float) (e - hot_count);
-        }
+        fill_part(l.ffn_up_exps,      split.up_cold,      cold_list);
+        fill_part(l.ffn_gate_exps,    split.gate_cold,    cold_list);
+        fill_part(l.ffn_down_exps,    split.down_cold,    cold_list);
+        fill_part(l.ffn_gate_up_exps, split.gate_up_cold, cold_list);
+
+        std::vector<float> hm(n_expert, -1.0f), cm(n_expert, -1.0f);
+        for (size_t i = 0; i < hot_list.size();  i++) { hm[hot_list[i]]  = (float) i; }
+        for (size_t i = 0; i < cold_list.size(); i++) { cm[cold_list[i]] = (float) i; }
         ggml_backend_tensor_set(hot_map,  hm.data(), 0, hm.size()*sizeof(float));
         ggml_backend_tensor_set(cold_map, cm.data(), 0, cm.size()*sizeof(float));
 
