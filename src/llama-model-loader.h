@@ -236,7 +236,7 @@ struct llama_model_loader {
 
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::vector<int64_t> & ne, int flags);
 
     void done_getting_tensors(bool partial = false) const;
 
@@ -250,6 +250,10 @@ struct llama_model_loader {
     // read a byte range of a weight's data
     // with mmap, returns a pointer into the mapping, otherwise reads into buf and returns buf
     const void * load_data_range(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const;
+
+    // same, but the bound is the file's tensor rather than the model tensor (a split part is smaller), and a
+    // file that was not mapped is read from the file itself
+    const void * load_data_range_raw(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const;
 
     // Returns false if cancelled by progress_callback
     bool load_all_data(

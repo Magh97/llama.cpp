@@ -2067,6 +2067,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
+        // the hot/cold expert split reads the cold experts from the file, so it runs while the mappings are alive
+        create_expert_splits(ml);
+
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
@@ -2232,99 +2235,107 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
 
-    create_expert_splits();
-
     return true;
+}
+
+// experts kept on the GPU when GGML_EXPERT_SPLIT=N is set (0 = no split)
+// experts kept on the GPU when GGML_EXPERT_SPLIT=N is set (0 = no split)
+static int64_t expert_split_hot_env() {
+    const char * env = getenv("GGML_EXPERT_SPLIT");
+    return env != nullptr ? atoll(env) : 0;
+}
+
+int64_t llama_model::expert_split_hot() const {
+    return expert_split_hot_env();
 }
 
 // Build the hot/cold expert split for every MoE layer when GGML_EXPERT_SPLIT=N asks for it.
 //
-// This is a prefix split (experts [0, N) hot, the rest cold) with both sides on the layer's own device, which
-// is what validates the graph path end to end: with the split on, the output must be identical to the model
-// without it. Reading an expert profile and placing the cold side in system RAM comes next.
-void llama_model::create_expert_splits() {
-    const char * env = getenv("GGML_EXPERT_SPLIT");
-    if (env == nullptr) {
-        return;
-    }
-    const int64_t hot_count = atoll(env);
+// The archs create the routed-expert tensors with only the first N experts on the layer's device, so the full
+// tensor never exists: the loader fills that prefix straight from the file (it reads the model tensor's size).
+// This fills in the rest - the cold experts go to system RAM, also straight from the file - and builds the two
+// maps that translate a router id into each side's expert index.
+void llama_model::create_expert_splits(llama_model_loader & ml) {
+    const int64_t hot_count = expert_split_hot();
     if (hot_count <= 0) {
         return;
     }
 
     moe_splits.assign(layers.size(), {});
 
+    const int64_t n_expert = (int64_t) hparams.n_expert;
+    if (n_expert <= hot_count) {
+        return;
+    }
+    const int64_t cold_count = n_expert - hot_count;
+
     int n_layers_split = 0;
     for (size_t il = 0; il < layers.size(); il++) {
         llama_layer & l = layers[il];
 
         ggml_tensor * any = l.ffn_gate_up_exps != nullptr ? l.ffn_gate_up_exps : l.ffn_up_exps;
-        if (any == nullptr) {
-            continue;
+        if (any == nullptr || any->ne[2] != hot_count) {
+            continue;   // the arch created the full tensor for this layer
         }
-        const int64_t n_expert = any->ne[2];
-        if (hot_count >= n_expert) {
-            continue;
-        }
-        const int64_t cold_count = n_expert - hot_count;
 
         ggml_backend_dev_t dev = dev_layer((int) il);
-        ggml_backend_buffer_type_t buft = dev != nullptr ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t buft_hot = dev != nullptr ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
 
-        ggml_init_params params = {
-            /*.mem_size   =*/ (size_t) 32*ggml_tensor_overhead(),
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
-        };
-        ggml_context_ptr ctx { ggml_init(params) };
-        if (!ctx) {
+        // the cold side and its map live in system RAM, the hot map next to the hot weights
+        ggml_init_params params_cpu = { /*.mem_size =*/ (size_t) 16*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+        ggml_context_ptr ctx_cpu { ggml_init(params_cpu) };
+        ggml_init_params params_hot = { /*.mem_size =*/ (size_t)  4*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+        ggml_context_ptr ctx_hot { ggml_init(params_hot) };
+        if (!ctx_cpu || !ctx_hot) {
             throw std::runtime_error("failed to create the expert-split context");
         }
 
-        auto new_part = [&](ggml_tensor * src, int64_t n) -> ggml_tensor * {
-            return ggml_new_tensor_3d(ctx.get(), src->type, src->ne[0], src->ne[1], n);
+        auto make_cold = [&](ggml_tensor * hot) -> ggml_tensor * {
+            if (hot == nullptr) {
+                return nullptr;
+            }
+            return ggml_new_tensor_3d(ctx_cpu.get(), hot->type, hot->ne[0], hot->ne[1], cold_count);
         };
 
         llm_moe_split & split = moe_splits[il];
 
-        ggml_tensor * up_hot    = l.ffn_up_exps      ? new_part(l.ffn_up_exps,      hot_count)  : nullptr;
-        ggml_tensor * up_cold   = l.ffn_up_exps      ? new_part(l.ffn_up_exps,      cold_count) : nullptr;
-        ggml_tensor * gate_hot  = l.ffn_gate_exps    ? new_part(l.ffn_gate_exps,    hot_count)  : nullptr;
-        ggml_tensor * gate_cold = l.ffn_gate_exps    ? new_part(l.ffn_gate_exps,    cold_count) : nullptr;
-        ggml_tensor * down_hot  = l.ffn_down_exps    ? new_part(l.ffn_down_exps,    hot_count)  : nullptr;
-        ggml_tensor * down_cold = l.ffn_down_exps    ? new_part(l.ffn_down_exps,    cold_count) : nullptr;
-        ggml_tensor * gu_hot    = l.ffn_gate_up_exps ? new_part(l.ffn_gate_up_exps, hot_count)  : nullptr;
-        ggml_tensor * gu_cold   = l.ffn_gate_up_exps ? new_part(l.ffn_gate_up_exps, cold_count) : nullptr;
+        split.up_cold      = make_cold(l.ffn_up_exps);
+        split.gate_cold    = make_cold(l.ffn_gate_exps);
+        split.down_cold    = make_cold(l.ffn_down_exps);
+        split.gate_up_cold = make_cold(l.ffn_gate_up_exps);
 
-        ggml_tensor * hot_map  = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, n_expert, 1);
-        ggml_tensor * cold_map = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, n_expert, 1);
+        ggml_tensor * cold_map = ggml_new_tensor_3d(ctx_cpu.get(), GGML_TYPE_F32, 1, n_expert, 1);
+        ggml_tensor * hot_map  = ggml_new_tensor_3d(ctx_hot.get(), GGML_TYPE_F32, 1, n_expert, 1);
 
-        ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
-        if (!buffer) {
-            throw std::runtime_error("failed to allocate the expert-split buffer");
+        ggml_backend_buffer_ptr buf_cpu { ggml_backend_alloc_ctx_tensors_from_buft(ctx_cpu.get(), ggml_backend_cpu_buffer_type()) };
+        ggml_backend_buffer_ptr buf_hot { ggml_backend_alloc_ctx_tensors_from_buft(ctx_hot.get(), buft_hot) };
+        if (!buf_cpu || !buf_hot) {
+            throw std::runtime_error("failed to allocate the expert-split buffers");
         }
-        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_set_usage(buf_cpu.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_set_usage(buf_hot.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-        auto fill = [&](ggml_tensor * src, ggml_tensor * hot, ggml_tensor * cold) {
-            if (src == nullptr) {
+        // fill the cold experts from the file (the hot prefix was filled by the loader)
+        auto fill_cold = [&](ggml_tensor * hot, ggml_tensor * cold) {
+            if (hot == nullptr) {
                 return;
             }
-            const size_t slab = src->nb[2];  // one expert's bytes (model tensors are contiguous)
-            std::vector<char> buf(slab);
-            for (int64_t e = 0; e < n_expert; e++) {
-                ggml_backend_tensor_get(src, buf.data(), (size_t) e*slab, slab);
-                if (e < hot_count) {
-                    ggml_backend_tensor_set(hot,  buf.data(), (size_t) e*slab, slab);
-                } else {
-                    ggml_backend_tensor_set(cold, buf.data(), (size_t) (e - hot_count)*slab, slab);
-                }
+            const auto it = ml.weights_map.find(hot->name);
+            if (it == ml.weights_map.end()) {
+                throw std::runtime_error(format("expert split: no weight entry for '%s'", hot->name));
+            }
+            const size_t slab = hot->nb[2];  // one expert's bytes
+            std::vector<char> tmp(slab);
+            for (int64_t e = hot_count; e < n_expert; e++) {
+                const void * src = ml.load_data_range_raw(it->second, (size_t) e*slab, slab, tmp.data());
+                ggml_backend_tensor_set(cold, src, (size_t) (e - hot_count)*slab, slab);
             }
         };
 
-        fill(l.ffn_up_exps,      up_hot,   up_cold);
-        fill(l.ffn_gate_exps,    gate_hot, gate_cold);
-        fill(l.ffn_down_exps,    down_hot, down_cold);
-        fill(l.ffn_gate_up_exps, gu_hot,   gu_cold);
+        fill_cold(l.ffn_up_exps,      split.up_cold);
+        fill_cold(l.ffn_gate_exps,    split.gate_cold);
+        fill_cold(l.ffn_down_exps,    split.down_cold);
+        fill_cold(l.ffn_gate_up_exps, split.gate_up_cold);
 
         std::vector<float> hm(n_expert), cm(n_expert);
         for (int64_t e = 0; e < n_expert; e++) {
@@ -2334,36 +2345,50 @@ void llama_model::create_expert_splits() {
         ggml_backend_tensor_set(hot_map,  hm.data(), 0, hm.size()*sizeof(float));
         ggml_backend_tensor_set(cold_map, cm.data(), 0, cm.size()*sizeof(float));
 
-        split.up_hot       = up_hot;
-        split.up_cold      = up_cold;
-        split.gate_hot     = gate_hot;
-        split.gate_cold    = gate_cold;
-        split.down_hot     = down_hot;
-        split.down_cold    = down_cold;
-        split.gate_up_hot  = gu_hot;
-        split.gate_up_cold = gu_cold;
+        split.up_hot       = l.ffn_up_exps;
+        split.gate_hot     = l.ffn_gate_exps;
+        split.down_hot     = l.ffn_down_exps;
+        split.gate_up_hot  = l.ffn_gate_up_exps;
         split.hot_map      = hot_map;
         split.cold_map     = cold_map;
 
-        std::vector<ggml_backend_buffer_ptr> buffers;
-        buffers.emplace_back(std::move(buffer));
-        pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+        std::vector<ggml_backend_buffer_ptr> bufs_cpu;
+        bufs_cpu.emplace_back(std::move(buf_cpu));
+        pimpl->ctxs_bufs.emplace_back(std::move(ctx_cpu), std::move(bufs_cpu));
+        std::vector<ggml_backend_buffer_ptr> bufs_hot;
+        bufs_hot.emplace_back(std::move(buf_hot));
+        pimpl->ctxs_bufs.emplace_back(std::move(ctx_hot), std::move(bufs_hot));
 
         n_layers_split++;
     }
 
     if (n_layers_split > 0) {
-        LLAMA_LOG_INFO("%s: hot/cold expert split: %d layers, %lld hot experts each\n", __func__, n_layers_split, (long long) hot_count);
+        LLAMA_LOG_INFO("%s: hot/cold expert split: %d layers, %lld hot experts on the device, %lld in RAM\n",
+                __func__, n_layers_split, (long long) hot_count, (long long) cold_count);
     }
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-    return ml.create_tensor(
+    ggml_tensor * t_created = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-        tn, ne, flags);
-}
+        tn, std::vector<int64_t>(ne), flags);
 
+    // hot/cold expert split: keep only the hot prefix of a routed-expert tensor. The loader validates `ne`
+    // against the file but builds the tensor from the file's shape, so shrink it here - the buffers are
+    // allocated later, from the tensor's own size - and create_expert_splits() builds the cold experts in RAM.
+    const int64_t hot = expert_split_hot_env();
+    if (t_created != nullptr && hot > 0 && t_created->ne[3] == 1 &&
+            (tn.tensor == LLM_TENSOR_FFN_UP_EXPS   || tn.tensor == LLM_TENSOR_FFN_GATE_EXPS ||
+             tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS || tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS) &&
+            hot < t_created->ne[2]) {
+        t_created->ne[2] = hot;
+        t_created->nb[2] = t_created->nb[1]*t_created->ne[1];
+        t_created->nb[3] = t_created->nb[2]*t_created->ne[2];
+    }
+
+    return t_created;
+}
 std::string llama_model::arch_name() const {
     return llm_arch_name(arch);
 }

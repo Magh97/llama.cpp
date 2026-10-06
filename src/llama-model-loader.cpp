@@ -1120,7 +1120,7 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
 
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::vector<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
@@ -1490,6 +1490,22 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
 
     if (check_tensors && !ggml_validate_row_data(w.tensor->type, data, size)) {
         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(w.tensor)));
+    }
+
+    return data;
+}
+
+const void * llama_model_loader::load_data_range_raw(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const {
+    const void * data = buf;
+
+    if (use_mmap && w.idx < mappings.size() && mappings.at(w.idx) != nullptr) {
+        data = (const uint8_t *) mappings.at(w.idx)->addr() + w.offs + offs;
+    } else {
+        GGML_ASSERT(buf != nullptr);
+        GGML_ASSERT(w.idx < files.size());
+        const auto & file = files.at(w.idx);
+        file->seek(w.offs + offs, SEEK_SET);
+        file->read_raw(buf, size);
     }
 
     return data;

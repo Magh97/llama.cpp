@@ -713,7 +713,10 @@ struct llama_model {
     // hot/cold expert split, one entry per layer (empty when unused); see llm_moe_split
     std::vector<llm_moe_split> moe_splits;
 
-    void create_expert_splits();
+    // experts kept on the GPU when GGML_EXPERT_SPLIT=N is set (0 = no split)
+    int64_t expert_split_hot() const;
+
+    void create_expert_splits(llama_model_loader & ml);
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
