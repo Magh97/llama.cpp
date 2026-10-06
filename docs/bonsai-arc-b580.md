@@ -412,6 +412,35 @@ less work than `--n-cpu-moe`, which moves whole layers' experts: 19% against 75%
 The profiler is in `tools/expert-profile/`; per-expert placement and the `build_moe_ffn` split are the next
 step.
 
+## Expert residency (experimental)
+
+The profiler above says the routing is skewed enough that keeping the hot experts of every layer on the device
+leaves the CPU far less work than `--n-cpu-moe` at the same VRAM. That is implemented, opt-in, and measured:
+
+```sh
+# K experts per layer stay on the device, the rest live in system RAM; the profile picks which K
+GGML_EXPERT_SPLIT=128 GGML_EXPERT_PROFILE=qwopus35-profile.bin ./build-sycl/bin/llama-cli ...
+```
+
+- The archs create each routed-expert tensor with only K experts; the loader fills that from the file, and the
+  cold experts are built in system RAM, also from the file. Two id maps route the experts.
+- `KAT-Coder-V2.5-Dev-APEX-Compact`: SYCL buffer 15,489 -> 8,379 MiB (-46%) at K=128.
+- An identity profile (equal counts, so the hot set is the same prefix) is bit-identical to the prefix split, so
+  the selection path is exact. A confident task gives the same output with the split on.
+
+**It is slower, though.** Arc B580 12 GB, 35B-A3B, same 10,603 MiB budget, `tg128` at 0 / 32K:
+
+| config | CPU share of expert work | tokens/s |
+| --- | ---: | ---: |
+| `--n-cpu-moe 20` (whole layers' experts on the CPU) | 50% | 48.9 / 46.5 |
+| expert split, prefix hot set (K=128) | 6.4% | 35.5 / 34.5 |
+| expert split, profile-driven hot set (K=128) | 6.4% | 37.5 / 37.1 |
+
+The split does about 8x less CPU expert work and is still 22% slower: llama.cpp runs each backend split in
+order, so every layer becomes a GPU->CPU handoff (40 per token instead of 20), plus a few small ops for the two
+id remaps. The profile-driven set is 5.7% faster than a prefix, so the mechanism works - what is missing is the
+overlap of CPU and GPU work, which is a scheduler-level change, not a placement one.
+
 ## Switches (SYCL)
 
 All optimisations are on by default, including the XMX decode attention on an Xe2 or newer GPU (Arc B-series, Lunar Lake,
