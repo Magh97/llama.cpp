@@ -3531,9 +3531,19 @@ static void mul_mat_vec_q_moe(
     const int expert_idx = item_ct1.get_group(1);
     const int i02        = ids_dev[expert_idx];
 
+    float * dst = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
+
+    // -1: the expert is not on this side of a hot/cold split, its slot reads as 0
+    if (i02 < 0) {
+        const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+        if (row < nrows && item_ct1.get_local_id(2) == 0) {
+            dst[row] = 0.0f;
+        }
+        return;
+    }
+
     const char * vx = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
     const char * vy = (const char *) vy_base + (size_t) expert_idx * src1_row_stride;
-    float *      dst = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
 
     const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
 
@@ -3736,9 +3746,19 @@ static void mul_mat_vec_q_moe_reorder(
     const int expert_idx = item_ct1.get_group(1);
     const int i02        = ids_dev[expert_idx];
 
+    float * dst = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
+
+    // -1: the expert is not on this side of a hot/cold split, its slot reads as 0
+    if (i02 < 0) {
+        const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+        if (row < nrows && item_ct1.get_local_id(2) == 0) {
+            dst[row] = 0.0f;
+        }
+        return;
+    }
+
     const char * vx  = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
     const char * vy  = (const char *) vy_base + (size_t) expert_idx * src1_row_stride;
-    float *      dst = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
 
     const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
     if (row >= nrows) {

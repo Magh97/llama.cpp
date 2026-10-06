@@ -1676,7 +1676,14 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                assert(i02 < n_as);
+
+                if (i02 < 0) {
+                    // -1: the expert is not on this backend's side of a hot/cold split, its slot must read as 0
+                    float * dst_col = (float *) ((char *) dst->data + (id*nb1 + iid1*nb2));
+                    memset(dst_col, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;

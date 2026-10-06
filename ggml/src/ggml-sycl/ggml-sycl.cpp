@@ -5203,20 +5203,25 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
 
 // counting sort of the routed rows by expert id (row_id_i, as chosen by the router):
 // builds a projection of a memory layout where each expert's slice is contiguous
-static void mmid_counting_sort_rows(
+static int64_t mmid_counting_sort_rows(   // returns the routed row count; negative ids (not on this side) are skipped
         const ggml_tensor * ids, const char * ids_host,
-        int64_t n_ids, int64_t n_as, int64_t n_routed_rows,
+        int64_t n_ids, int64_t n_as, int64_t n_routed_rows_max,
         std::vector<int64_t> & expert_counts,
         std::vector<int64_t> & expert_row_offsets,
         std::vector<mmid_row_mapping> & routed_row_src) {
 
     // frequencies: how many routed rows each expert "owns"
     expert_counts.assign(n_as, 0);
+    int64_t n_routed = 0;
     for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
         for (int64_t id = 0; id < n_ids; id++) {
             const int32_t row_id_i = *(const int32_t *) (ids_host + iid1*ids->nb[1] + id*ids->nb[0]);
-            GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
+            GGML_ASSERT(row_id_i < n_as);
+            if (row_id_i < 0) {
+                continue;
+            }
             expert_counts[row_id_i]++;
+            n_routed++;
         }
     }
 
@@ -5227,11 +5232,14 @@ static void mmid_counting_sort_rows(
     }
 
     std::vector<int64_t> expert_row_next = expert_row_offsets;
-    routed_row_src.resize(n_routed_rows);
+    routed_row_src.resize(n_routed_rows_max);
     for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
         for (int64_t id = 0; id < n_ids; id++) {
             const int32_t row_id_i = *(const int32_t *) (ids_host + iid1*ids->nb[1] + id*ids->nb[0]);
-            GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
+            GGML_ASSERT(row_id_i < n_as);
+            if (row_id_i < 0) {
+                continue;
+            }
 
             // find and validate the next free row for a given expert (row_id_i)
             const int64_t routed_row = expert_row_next[row_id_i]++;
@@ -5240,6 +5248,7 @@ static void mmid_counting_sort_rows(
             routed_row_src[routed_row] = {(int32_t) id, (int32_t) iid1};
         }
     }
+    return n_routed;
 }
 
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
@@ -5299,13 +5308,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t i02 = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
-                GGML_ASSERT(i02 >= 0 && i02 < n_as);
+                GGML_ASSERT(i02 < n_as);
 
                 const int64_t i11 = id % ne11;
                 const int64_t i12 = iid1;
 
                 const int64_t i1 = id;
                 const int64_t i2 = i12;
+
+            if (i02 < 0) {
+                // -1: the expert is not on this side of a hot/cold split, its slot must read as 0
+                SYCL_CHECK(CHECK_TRY_ERROR(stream->memset(dst_original + i1*nb1 + i2*nb2, 0, ne0*sizeof(float))));
+                continue;
+            }
 
             src0_row.data = src0_original + i02*nb02;
             src1_row.data = src1_original + i11*nb11 + i12*nb12;
@@ -5315,9 +5330,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             }
         }
     } else {
-        const int64_t n_routed_rows = ids->ne[1] * n_ids;
-        ggml_sycl_pool_alloc<char> src1_contiguous(ctx.pool(), sizeof(float)*n_routed_rows*ne10);
-        ggml_sycl_pool_alloc<char>  dst_contiguous(ctx.pool(), sizeof(float)*n_routed_rows*ne0);
+        const int64_t n_routed_rows_max = ids->ne[1] * n_ids;
+        ggml_sycl_pool_alloc<char> src1_contiguous(ctx.pool(), sizeof(float)*n_routed_rows_max*ne10);
+        ggml_sycl_pool_alloc<char>  dst_contiguous(ctx.pool(), sizeof(float)*n_routed_rows_max*ne0);
 
         src1_row.data = src1_contiguous.get();
         dst_row.data  =  dst_contiguous.get();
@@ -5329,10 +5344,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         // the sources (slot/token pairs) of contiguous rows to guide k_copy_src1_to_contiguous
         std::vector<mmid_row_mapping> & routed_row_src = ctx.mmid_row_mapping_host;
 
-        mmid_counting_sort_rows(ids, ids_host.data(), n_ids, n_as, n_routed_rows,
+        const int64_t n_routed_rows = mmid_counting_sort_rows(ids, ids_host.data(), n_ids, n_as, n_routed_rows_max,
                                 expert_row_counts, expert_row_offsets, routed_row_src);
 
-        ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
+        // -1 slots (the expert is not on this side of a hot/cold split) must read as 0
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
+            for (int64_t id = 0; id < n_ids; id++) {
+                const int32_t i02 = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
+                if (i02 >= 0) {
+                    continue;
+                }
+                SYCL_CHECK(CHECK_TRY_ERROR(stream->memset(dst_original + id*nb1 + iid1*nb2, 0, ne0*sizeof(float))));
+            }
+        }
+
+        ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), std::max<int64_t>(1, n_routed_rows));
         SYCL_CHECK(CHECK_TRY_ERROR(
                 stream->memcpy(dev_row_mapping.get(), routed_row_src.data(), n_routed_rows*sizeof(mmid_row_mapping))));
 
