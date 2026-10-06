@@ -2390,7 +2390,9 @@ void llama_model::create_expert_splits(llama_model_loader & ml) {
         ggml_tensor * cold_map = ggml_new_tensor_3d(ctx_cpu.get(), GGML_TYPE_I32, 1, n_expert, 1);
         ggml_tensor * hot_map  = ggml_new_tensor_3d(ctx_hot.get(), GGML_TYPE_I32, 1, n_expert, 1);
 
-        ggml_backend_buffer_ptr buf_cpu { ggml_backend_alloc_ctx_tensors_from_buft(ctx_cpu.get(), ggml_backend_cpu_buffer_type()) };
+        // DIAGNOSTIC: put the cold side on the device as well (no CPU transitions, same graph shape)
+        ggml_backend_buffer_type_t buft_cold = getenv("GGML_EXPERT_SPLIT_COLD_GPU") ? buft_hot : ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_ptr buf_cpu { ggml_backend_alloc_ctx_tensors_from_buft(ctx_cpu.get(), buft_cold) };
         ggml_backend_buffer_ptr buf_hot { ggml_backend_alloc_ctx_tensors_from_buft(ctx_hot.get(), buft_hot) };
         if (!buf_cpu || !buf_hot) {
             throw std::runtime_error("failed to allocate the expert-split buffers");
