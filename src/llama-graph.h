@@ -786,6 +786,22 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+// Hot/cold expert split for one layer (see build_moe_ffn): the same routed-expert weights split by expert
+// across two tensors - typically the hot set on the GPU and the cold set in system RAM - plus a map from the
+// router's expert id to each side's expert index (-1 = this side does not hold that expert).
+struct llm_moe_split {
+    struct ggml_tensor * up_hot        = nullptr;
+    struct ggml_tensor * up_cold       = nullptr;
+    struct ggml_tensor * gate_hot      = nullptr;
+    struct ggml_tensor * gate_cold     = nullptr;
+    struct ggml_tensor * down_hot      = nullptr;
+    struct ggml_tensor * down_cold     = nullptr;
+    struct ggml_tensor * gate_up_hot   = nullptr;
+    struct ggml_tensor * gate_up_cold  = nullptr;
+    struct ggml_tensor * hot_map       = nullptr;   // I32 [n_expert]
+    struct ggml_tensor * cold_map      = nullptr;   // I32 [n_expert]
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -808,6 +824,8 @@ struct llm_graph_params {
     const llama_hadamard_rotations * hadamard_inverses  = nullptr;
 
     const llama_prec_policy * prec_policy = nullptr;
+
+    const std::vector<llm_moe_split> * moe_splits = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1054,6 +1072,8 @@ struct llm_graph_context {
 
     const llama_prec_policy * prec_policy;
 
+    const std::vector<llm_moe_split> * moe_splits;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -1186,7 +1206,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * weights_ids_in = nullptr) const;
 
     //
     // inputs

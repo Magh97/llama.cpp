@@ -710,6 +710,11 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 
+    // hot/cold expert split, one entry per layer (empty when unused); see llm_moe_split
+    std::vector<llm_moe_split> moe_splits;
+
+    void create_expert_splits();
+
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models

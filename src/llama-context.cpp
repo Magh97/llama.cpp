@@ -2566,6 +2566,7 @@ llm_graph_params llama_context::graph_params(
         /*.hadamard_rotations =*/ &hadamard_rotations,
         /*.hadamard_inverses  =*/ &hadamard_inverses,
         /*.prec_policy =*/ &model.prec_policy,
+        /*.moe_splits  =*/ &model.moe_splits,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

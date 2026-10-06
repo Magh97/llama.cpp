@@ -2231,7 +2231,130 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 rotations.size(), sign_tensors.size());
     }
 
+
+    create_expert_splits();
+
     return true;
+}
+
+// Build the hot/cold expert split for every MoE layer when GGML_EXPERT_SPLIT=N asks for it.
+//
+// This is a prefix split (experts [0, N) hot, the rest cold) with both sides on the layer's own device, which
+// is what validates the graph path end to end: with the split on, the output must be identical to the model
+// without it. Reading an expert profile and placing the cold side in system RAM comes next.
+void llama_model::create_expert_splits() {
+    const char * env = getenv("GGML_EXPERT_SPLIT");
+    if (env == nullptr) {
+        return;
+    }
+    const int64_t hot_count = atoll(env);
+    if (hot_count <= 0) {
+        return;
+    }
+
+    moe_splits.assign(layers.size(), {});
+
+    int n_layers_split = 0;
+    for (size_t il = 0; il < layers.size(); il++) {
+        llama_layer & l = layers[il];
+
+        ggml_tensor * any = l.ffn_gate_up_exps != nullptr ? l.ffn_gate_up_exps : l.ffn_up_exps;
+        if (any == nullptr) {
+            continue;
+        }
+        const int64_t n_expert = any->ne[2];
+        if (hot_count >= n_expert) {
+            continue;
+        }
+        const int64_t cold_count = n_expert - hot_count;
+
+        ggml_backend_dev_t dev = dev_layer((int) il);
+        ggml_backend_buffer_type_t buft = dev != nullptr ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ (size_t) 32*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(params) };
+        if (!ctx) {
+            throw std::runtime_error("failed to create the expert-split context");
+        }
+
+        auto new_part = [&](ggml_tensor * src, int64_t n) -> ggml_tensor * {
+            return ggml_new_tensor_3d(ctx.get(), src->type, src->ne[0], src->ne[1], n);
+        };
+
+        llm_moe_split & split = moe_splits[il];
+
+        ggml_tensor * up_hot    = l.ffn_up_exps      ? new_part(l.ffn_up_exps,      hot_count)  : nullptr;
+        ggml_tensor * up_cold   = l.ffn_up_exps      ? new_part(l.ffn_up_exps,      cold_count) : nullptr;
+        ggml_tensor * gate_hot  = l.ffn_gate_exps    ? new_part(l.ffn_gate_exps,    hot_count)  : nullptr;
+        ggml_tensor * gate_cold = l.ffn_gate_exps    ? new_part(l.ffn_gate_exps,    cold_count) : nullptr;
+        ggml_tensor * down_hot  = l.ffn_down_exps    ? new_part(l.ffn_down_exps,    hot_count)  : nullptr;
+        ggml_tensor * down_cold = l.ffn_down_exps    ? new_part(l.ffn_down_exps,    cold_count) : nullptr;
+        ggml_tensor * gu_hot    = l.ffn_gate_up_exps ? new_part(l.ffn_gate_up_exps, hot_count)  : nullptr;
+        ggml_tensor * gu_cold   = l.ffn_gate_up_exps ? new_part(l.ffn_gate_up_exps, cold_count) : nullptr;
+
+        ggml_tensor * hot_map  = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, n_expert, 1);
+        ggml_tensor * cold_map = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, n_expert, 1);
+
+        ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+        if (!buffer) {
+            throw std::runtime_error("failed to allocate the expert-split buffer");
+        }
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        auto fill = [&](ggml_tensor * src, ggml_tensor * hot, ggml_tensor * cold) {
+            if (src == nullptr) {
+                return;
+            }
+            const size_t slab = src->nb[2];  // one expert's bytes (model tensors are contiguous)
+            std::vector<char> buf(slab);
+            for (int64_t e = 0; e < n_expert; e++) {
+                ggml_backend_tensor_get(src, buf.data(), (size_t) e*slab, slab);
+                if (e < hot_count) {
+                    ggml_backend_tensor_set(hot,  buf.data(), (size_t) e*slab, slab);
+                } else {
+                    ggml_backend_tensor_set(cold, buf.data(), (size_t) (e - hot_count)*slab, slab);
+                }
+            }
+        };
+
+        fill(l.ffn_up_exps,      up_hot,   up_cold);
+        fill(l.ffn_gate_exps,    gate_hot, gate_cold);
+        fill(l.ffn_down_exps,    down_hot, down_cold);
+        fill(l.ffn_gate_up_exps, gu_hot,   gu_cold);
+
+        std::vector<float> hm(n_expert), cm(n_expert);
+        for (int64_t e = 0; e < n_expert; e++) {
+            hm[e] = e < hot_count ? (float) e : -1.0f;
+            cm[e] = e < hot_count ? -1.0f : (float) (e - hot_count);
+        }
+        ggml_backend_tensor_set(hot_map,  hm.data(), 0, hm.size()*sizeof(float));
+        ggml_backend_tensor_set(cold_map, cm.data(), 0, cm.size()*sizeof(float));
+
+        split.up_hot       = up_hot;
+        split.up_cold      = up_cold;
+        split.gate_hot     = gate_hot;
+        split.gate_cold    = gate_cold;
+        split.down_hot     = down_hot;
+        split.down_cold    = down_cold;
+        split.gate_up_hot  = gu_hot;
+        split.gate_up_cold = gu_cold;
+        split.hot_map      = hot_map;
+        split.cold_map     = cold_map;
+
+        std::vector<ggml_backend_buffer_ptr> buffers;
+        buffers.emplace_back(std::move(buffer));
+        pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+
+        n_layers_split++;
+    }
+
+    if (n_layers_split > 0) {
+        LLAMA_LOG_INFO("%s: hot/cold expert split: %d layers, %lld hot experts each\n", __func__, n_layers_split, (long long) hot_count);
+    }
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {

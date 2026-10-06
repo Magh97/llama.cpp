@@ -1492,6 +1492,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hadamard_rotations(params.hadamard_rotations),
     hadamard_inverses (params.hadamard_inverses),
     prec_policy      (params.prec_policy),
+    moe_splits       (params.moe_splits),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2077,7 +2078,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * weights_ids_in) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2183,7 +2185,51 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
-    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+    // hot/cold expert split: run the pipeline once per side with the ids that side holds (-1 is skipped by
+    // mul_mat_id and reads as weight 0) and add the two partial results. The recursive calls pass
+    // selected_experts_in, so only the outermost call splits. logits go in as probs_in: the gating is
+    // re-applied identically on both sides and no argsort is repeated.
+    const llm_moe_split * moe_split = nullptr;
+    if (selected_experts_in == nullptr && moe_splits != nullptr &&
+            il >= 0 && il < (int) moe_splits->size()) {
+        const llm_moe_split & s = (*moe_splits)[il];
+        if (s.hot_map != nullptr && s.cold_map != nullptr) {
+            moe_split = &s;
+        }
+    }
+
+    if (moe_split != nullptr) {
+        // the maps are [1, n_expert, 1]: repeat them per token so get_rows can index them batch-wise
+        auto remap = [&](ggml_tensor * map) -> ggml_tensor * {
+            ggml_tensor * t = ggml_repeat_4d(ctx0, map, 1, n_expert, n_tokens, 1);
+            t = ggml_get_rows(ctx0, t, selected_experts);            // [1, n_expert_used, n_tokens]
+            t = ggml_reshape_2d(ctx0, t, n_expert_used, n_tokens);   // [n_expert_used, n_tokens]
+            return ggml_cast(ctx0, t, GGML_TYPE_I32);
+        };
+
+        ggml_tensor * ids_hot  = remap(moe_split->hot_map);
+        cb(ids_hot,  "ffn_moe_topk_hot",  il);
+        ggml_tensor * ids_cold = remap(moe_split->cold_map);
+        cb(ids_cold, "ffn_moe_topk_cold", il);
+
+        ggml_tensor * e_hot = build_moe_ffn(cur, gate_inp, nullptr,
+                moe_split->up_hot, nullptr, moe_split->gate_hot, nullptr, moe_split->down_hot, nullptr, exp_probs_b,
+                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il, logits,
+                moe_split->gate_up_hot, nullptr, nullptr, nullptr, nullptr, ids_hot, selected_experts);
+        cb(e_hot, "ffn_moe_out_hot", il);
+
+        ggml_tensor * e_cold = build_moe_ffn(cur, gate_inp, nullptr,
+                moe_split->up_cold, nullptr, moe_split->gate_cold, nullptr, moe_split->down_cold, nullptr, exp_probs_b,
+                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il, logits,
+                moe_split->gate_up_cold, nullptr, nullptr, nullptr, nullptr, ids_cold, selected_experts);
+        cb(e_cold, "ffn_moe_out_cold", il);
+
+        return ggml_add(ctx0, e_hot, e_cold);
+    }
+
+    // the weights always come from the router's own ids: a split remaps the ids for the matmuls only
+    ggml_tensor * weights_ids = weights_ids_in != nullptr ? weights_ids_in : selected_experts;
+    ggml_tensor * weights = ggml_get_rows(ctx0, probs, weights_ids); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
 

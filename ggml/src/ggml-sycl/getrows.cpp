@@ -45,6 +45,15 @@ static void k_get_rows(
     const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
 
     dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+
+    if (i01 < 0) {
+        // -1: no row (a hot/cold expert split asks for an expert this side does not hold), the row reads as 0
+        for (int i = i00; i < i00 + 2 && i < ne00; ++i) {
+            dst_row[i] = (dst_t) 0;
+        }
+        return;
+    }
+
     const void * src0_row = (const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03;
 
     const int ib = i00/qk; // block index
@@ -89,6 +98,15 @@ static void k_get_rows_f32(
     const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
 
     dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+
+    if (i01 < 0) {
+        // -1: no row (a hot/cold expert split asks for an expert this side does not hold), the row reads as 0
+        for (int i = i00; i < i00 + 2 && i < ne00; ++i) {
+            dst_row[i] = (dst_t) 0;
+        }
+        return;
+    }
+
     const void * src0_row = (const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03;
 
     const int ib = i00/qk;
@@ -132,6 +150,15 @@ static void k_get_rows_float(
     const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
 
     dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+
+    if (i01 < 0) {
+        // -1: no row (a hot/cold expert split asks for an expert this side does not hold), the row reads as 0
+        for (int i = i00; i < i00 + 2 && i < ne00; ++i) {
+            dst_row[i] = (dst_t) 0;
+        }
+        return;
+    }
+
     const src0_t * src0_row = (const src0_t *)((const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03);
 
     dst_row[i00] = src0_row[i00];
