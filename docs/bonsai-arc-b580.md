@@ -365,6 +365,25 @@ sliding layers of Gemma 4 are capped by their window (4 tiles) and are unaffecte
 
 To reproduce the before/after on another card: `benches/arc-decode-attention/run.sh <model.gguf>`.
 
+### q8_0 KV cache
+
+The fast decode path also serves a **q8_0** KV cache (it took q4_0 only before, so q8_0 fell back to the vector
+path). q8_0 rows are 272 bytes against 144 for q4_0, so the kernel runs 64-key tiles there instead of 128: at 128
+keys the K tile alone needs ~35 KB of SLM and the work-groups stop overlapping, which cancelled the gain entirely.
+Arc Pro B60, 35B-A3B, `tg128`, 2 repetitions:
+
+| context | generic path | q8_0 dec kernel | |
+|---|---:|---:|---:|
+| 0 | 91.6 | 92.0 | +0.4% |
+| 8K | 78.4 | 85.0 | +8% |
+| 32K | 56.1 | 67.6 | +21% |
+| 128K | 26.8 | 39.5 | +47% |
+
+q8_0 still costs about 15% against q4_0 at 32K (67.6 vs 83.6) - that is the 2x cache, not the kernel. The q8_0
+path serves 1-2 query tokens; MTP or n-gram verify batches of 3-8 tokens still use the vector path with q8_0, so
+pair it with `--spec-draft-n-max 1` or with q4_0 KV when speculating. Greedy output stays coherent and matches the
+generic path where the choice is clear, with the same near-tie flips in free-form text as the other shapes.
+
 ### Speculative decoding (MTP) after the faster decode
 
 The faster the base decode, the less drafting pays. On a 256-token code answer (llama-cli `Generation:`, greedy,

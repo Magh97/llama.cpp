@@ -240,7 +240,7 @@ static void fattn_dec_q4_0_v3(const char * Q, const char * K, const char * V, co
     });
 }
 
-template <int G, int NQ, int TK, bool PIPE>
+template <int G, int NQ, int TK, bool PIPE, bool KV8 = false>
 static void fattn_dec_q4_0(const char * Q, const char * K, const char * V, const char * mask, float * dst,
                            float * parts, sycl::float2 * meta, float scale, int ne01, int ne02, int ne11,
                            int nkvh, int ne03, int64_t nb01, int64_t nb02, int64_t nb03, int64_t nb11,
@@ -251,7 +251,8 @@ static void fattn_dec_q4_0(const char * Q, const char * K, const char * V, const
     constexpr int NRG = DEC_WG / TK;        // row groups in the score phase: thread (rg, jj) = (tid / TK, tid % TK)
     constexpr int RPT = R / NRG;            // rows per thread in the score phase
     constexpr int NB  = DEC_D / QK4_0;
-    constexpr int KW  = DEC_D / QK4_0 * sizeof(block_q4_0) / 4;  // 36 dwords per q4_0 row (D 256)
+    constexpr int KW  = KV8 ? DEC_D / QK8_0 * sizeof(block_q8_0) / 4    // 68 dwords per q8_0 row (D 256)
+                            : DEC_D / QK4_0 * sizeof(block_q4_0) / 4;   // 36 dwords per q4_0 row
     constexpr int KWP = KW + 1;                                  // padded SLM row stride (bank conflicts)
     constexpr int PKW = TK * KW / DEC_WG;                        // dwords of a K or V tile per thread
     static_assert(TK % 16 == 0 && R % NRG == 0 && (TK * KW) % DEC_WG == 0 && G % RPT == 0, "shape");  // a thread's rows share one token
@@ -354,9 +355,26 @@ static void fattn_dec_q4_0(const char * Q, const char * K, const char * V, const
                                 auto byte_at = [&](int o) -> uint32_t {
                                     return (sK[kr + o / 4] >> (8 * (o % 4))) & 0xFFu;
                                 };
-                                const int      o0 = b * (int) sizeof(block_q4_0);
+                                const int      o0 = b * (KV8 ? (int) sizeof(block_q8_0) : (int) sizeof(block_q4_0));
                                 const uint16_t hb = (uint16_t) (byte_at(o0) | (byte_at(o0 + 1) << 8));
                                 const float    dk = static_cast<float>(sycl::bit_cast<sycl::half>(hb));
+                                if constexpr (KV8) {
+                                    // q8_0: one signed byte per value
+#pragma unroll
+                                    for (int i = 0; i < QK8_0; i += 4) {
+                                        sycl::float4 k0;
+#pragma unroll
+                                        for (int u = 0; u < 4; ++u) {
+                                            k0[u] = (float) (int8_t) byte_at(o0 + 2 + i + u) * dk;
+                                        }
+                                        const int d4 = (b * QK8_0 + i) / 4;
+#pragma unroll
+                                        for (int rr = 0; rr < RPT; ++rr) {
+                                            const sycl::float4 qa = sQ[qb + rr * (DEC_D / 4) + d4];
+                                            s[rr] += sycl::dot(qa, k0);
+                                        }
+                                    }
+                                } else {
 #pragma unroll
                                 for (int i = 0; i < QK4_0 / 2; i += 4) {
                                     sycl::float4 k0, k1;
@@ -373,6 +391,7 @@ static void fattn_dec_q4_0(const char * Q, const char * K, const char * V, const
                                         const sycl::float4 qc = sQ[qb + rr * (DEC_D / 4) + d4 + QK4_0 / 8];
                                         s[rr] += sycl::dot(qa, k0) + sycl::dot(qc, k1);
                                     }
+                                }
                                 }
                             }
                         }
@@ -430,16 +449,17 @@ static void fattn_dec_q4_0(const char * Q, const char * K, const char * V, const
                         for (int r = 0; r < RP; ++r) {
                             o[r] *= sA[r];
                         }
-                        const int ob = b * (int) sizeof(block_q4_0);          // scale bytes ob, ob + 1
-                        const int oq = ob + 2 + wi % (QK4_0 / 2);             // this dim's nibble byte
-                        const int sh = wi < QK4_0 / 2 ? 0 : 4;
+                        const int ob = b * (KV8 ? (int) sizeof(block_q8_0) : (int) sizeof(block_q4_0));  // scale bytes ob, ob + 1
+                        const int oq = ob + 2 + (KV8 ? wi % QK8_0 : wi % (QK4_0 / 2));                  // this dim's byte
+                        const int sh = KV8 ? 0 : (wi < QK4_0 / 2 ? 0 : 4);
 #pragma unroll 4
                         for (int k = 0; k < nk; ++k) {
                             const int      vr   = k * KWP;
                             const uint32_t sw   = sK[vr + ob / 4] >> (8 * (ob % 4));  // ob even: both scale bytes in one dword
                             const float    dv   = static_cast<float>(sycl::bit_cast<sycl::half>((uint16_t) (sw & 0xFFFFu)));
                             const int      byte = (sK[vr + oq / 4] >> (8 * (oq % 4))) & 0xFF;
-                            const float    vv   = (float) (((byte >> sh) & 0xF) - 8) * dv;
+                            const float    vv   = KV8 ? (float) (int8_t) byte * dv
+                                                      : (float) (((byte >> sh) & 0xF) - 8) * dv;
 #pragma unroll
                             for (int r4 = 0; r4 < RP / 4; ++r4) {
                                 const sycl::float4 p = sS[k * (RP / 4) + r4];
@@ -1000,21 +1020,23 @@ bool ggml_sycl_flash_attn_ext_dec_supported(const ggml_tensor * dst) {
     float max_bias = 0.0f, softcap = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
-    return K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 && Q->type == GGML_TYPE_F32 &&
-           // Bonsai 2 27B (head 256, 6 query heads per KV head); with the DPAS kernel also Gemma 4's global layers (512, 16)
-           ((K->ne[0] == DEC_D && Q->ne[2] == 6 * K->ne[2]) || (maxq && K->ne[0] == 512 && Q->ne[2] == 16 * K->ne[2]) ||
-            (K->ne[0] == DEC_D && Q->ne[2] == 8 * K->ne[2]) ||  // Qwen 3.6 / 3.5 MoE: 16 query heads over 2 KV heads
-            (K->ne[0] == DEC_D && Q->ne[2] == 4 * K->ne[2]) ||  // Qwen 3.5 / 3.6 9B dense: 16 query heads over 4 KV heads
-            (maxq && K->ne[0] == DEC_D && Q->ne[2] == 2 * K->ne[2])) &&  // Gemma 4 sliding layers (256, 2)
-           V->ne[0] == K->ne[0] && Q->ne[0] == K->ne[0] && V->ne[2] == K->ne[2] &&
-           Q->ne[1] >= 1 && Q->ne[1] <= (maxq ? maxq : 4) && Q->ne[3] == K->ne[3] && V->ne[3] == K->ne[3] &&  // 5-8: TILE is faster (v3<6,8> 1172-1240 vs 1049 us @16K)
-           !sinks && max_bias == 0.0f && softcap == 0.0f &&
-           (!mask || (mask->type == GGML_TYPE_F16 && mask->ne[2] == 1)) &&
-           Q->nb[0] == sizeof(float) && K->nb[0] == ggml_type_size(K->type) && V->nb[0] == ggml_type_size(V->type) &&
-           K->nb[1] % 4 == 0 && K->nb[2] % 4 == 0 && K->nb[3] % 4 == 0 && ((uintptr_t) K->data) % 4 == 0 &&
-           V->nb[1] % 4 == 0 && V->nb[2] % 4 == 0 && V->nb[3] % 4 == 0 && ((uintptr_t) V->data) % 4 == 0 &&
-           Q->nb[1] % 16 == 0 && Q->nb[2] % 16 == 0 && Q->nb[3] % 16 == 0 && ((uintptr_t) Q->data) % 16 == 0 &&
-           (!maxq || (K->nb[1] % 16 == 0 && K->nb[2] % 16 == 0 && K->nb[3] % 16 == 0 && ((uintptr_t) K->data) % 16 == 0));
+    const bool kv8 = K->type == GGML_TYPE_Q8_0;
+    const bool c_type  = (K->type == GGML_TYPE_Q4_0 || kv8) && V->type == K->type && Q->type == GGML_TYPE_F32;
+    const bool c_shape = ((K->ne[0] == DEC_D && Q->ne[2] == 6 * K->ne[2]) || (!kv8 && maxq && K->ne[0] == 512 && Q->ne[2] == 16 * K->ne[2]) ||
+                          (K->ne[0] == DEC_D && Q->ne[2] == 8 * K->ne[2]) ||   // Qwen 3.6 / 3.5 MoE: 16 query heads over 2 KV heads
+                          (K->ne[0] == DEC_D && Q->ne[2] == 4 * K->ne[2]) ||   // Qwen 3.5 / 3.6 9B dense: 16 query heads over 4 KV heads
+                          (!kv8 && maxq && K->ne[0] == DEC_D && Q->ne[2] == 2 * K->ne[2]));  // Gemma 4 sliding layers (256, 2)
+    const bool c_dims  = V->ne[0] == K->ne[0] && Q->ne[0] == K->ne[0] && V->ne[2] == K->ne[2];
+    // q8_0 has no DPAS kernel, and the plain kernel serves 1-2 tokens (more would need the v3 q4_0 kernel)
+    const bool c_tok   = Q->ne[1] >= 1 && Q->ne[1] <= (kv8 ? 2 : (maxq ? maxq : 4)) && Q->ne[3] == K->ne[3] && V->ne[3] == K->ne[3];
+    const bool c_bias  = !sinks && max_bias == 0.0f && softcap == 0.0f;
+    const bool c_mask  = (!mask || (mask->type == GGML_TYPE_F16 && mask->ne[2] == 1));
+    const bool c_align = Q->nb[0] == sizeof(float) && K->nb[0] == ggml_type_size(K->type) && V->nb[0] == ggml_type_size(V->type) &&
+                         K->nb[1] % 4 == 0 && K->nb[2] % 4 == 0 && K->nb[3] % 4 == 0 && ((uintptr_t) K->data) % 4 == 0 &&
+                         V->nb[1] % 4 == 0 && V->nb[2] % 4 == 0 && V->nb[3] % 4 == 0 && ((uintptr_t) V->data) % 4 == 0 &&
+                         Q->nb[1] % 16 == 0 && Q->nb[2] % 16 == 0 && Q->nb[3] % 16 == 0 && ((uintptr_t) Q->data) % 16 == 0 &&
+                         (!maxq || (K->nb[1] % 16 == 0 && K->nb[2] % 16 == 0 && K->nb[3] % 16 == 0 && ((uintptr_t) K->data) % 16 == 0));
+    return c_type && c_shape && c_dims && c_tok && c_bias && c_mask && c_align;
 }
 
 void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -1027,7 +1049,8 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
     const int ne01 = Q->ne[1];
-    const bool dpas = fattn_dec_dpas_maxq() > 0;
+    const bool kv8  = K->type == GGML_TYPE_Q8_0;   // q8_0 K/V: plain kernel only, 1-2 tokens
+    const bool dpas = !kv8 && fattn_dec_dpas_maxq() > 0;
     const bool d512 = K->ne[0] == 512;  // Gemma 4 global layers: DPAS kernel only, token chunks of 2 (16 heads x 2 rows)
     const bool g2   = !d512 && Q->ne[2] == 2 * K->ne[2];  // Gemma 4 sliding layers: DPAS kernel only, token chunks of 8
     const bool g8   = !d512 && !g2 && Q->ne[2] == 8 * K->ne[2];  // Qwen 3.6 / 3.5 MoE: 16 query heads over 2 KV heads
@@ -1036,6 +1059,7 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
     // keys per tile (must match the instantiations below); DPAS: 16 x KG
     const int tk   = (d512 || g2) ? (nq == 1 ? 256 : 128)
                    : dpas ? (nq == 1 ? 256 : nq == 2 ? 128 : nq == 4 ? 256 : 128)
+                   : kv8 ? (((g4 || g8) || nq == 2) ? 64 : 128)  // q8_0: 64-key tiles where the rows divide (272-byte rows)
                    : g8 ? (nq == 8 ? 64 : nq == 4 ? 64 : 128)  // G=8, >4 tokens: two 4-token chunks (FATTN_DEC_CALL(8, 4))
                    : nq == 8 ? 32 : nq == 4 ? 64 : 128;
     const int ne11 = K->ne[1];
@@ -1098,7 +1122,7 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
         }
     }
 #undef FATTN_DEC_DPAS
-#define FATTN_DEC_CALL(G_, NQ_) fattn_dec_q4_0<G_, NQ_, (NQ_ == 4 ? 64 : 128), (NQ_ != 4)>(  /* PIPE: see v4 notes */(const char *) Q->data, (const char *) K->data, (const char *) V->data, \
+#define FATTN_DEC_CALL(G_, NQ_, KV8_) fattn_dec_q4_0<G_, NQ_, (KV8_ ? ((G_ * NQ_) % 4 == 0 ? 64 : 128) : (NQ_ == 4 ? 64 : 128)), (NQ_ != 4), KV8_>(  /* PIPE: see v4 notes */(const char *) Q->data, (const char *) K->data, (const char *) V->data, \
         mdata, (float *) dst->data, parts.get(), meta.get(), scale, ne01, (int) Q->ne[2], ne11, (int) K->ne[2],           \
         (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], nb31,    \
         nb33, ne33, nsplit, chunk, stream)
@@ -1107,13 +1131,20 @@ void ggml_sycl_flash_attn_ext_dec(ggml_backend_sycl_context & ctx, ggml_tensor *
         (int) Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],                 \
         nb31, nb33, ne33, nsplit, chunk, stream)
     // G (query heads per KV head): 4 = Qwen 3.5 / 3.6 9B dense, 6 = Bonsai 2 27B, 8 = Qwen 3.6 / 3.5 MoE
-    if (!dpas && !d512 && !g2) switch (nq) {
-        case 1: if (g4) { FATTN_DEC_CALL(4, 1); } else if (g8) { FATTN_DEC_CALL(8, 1); } else { FATTN_DEC_CALL(6, 1); } break;
-        case 2: if (g4) { FATTN_DEC_CALL(4, 2); } else if (g8) { FATTN_DEC_CALL(8, 2); } else { FATTN_DEC_CALL(6, 2); } break;
+    if (kv8) {
+        // q8_0 K/V: the plain kernel serves 1-2 tokens (the support check limits ne01 to 2); the q4_0-only kernels above
+        if (nq == 1) {
+            if (g4) { FATTN_DEC_CALL(4, 1, true); } else if (g8) { FATTN_DEC_CALL(8, 1, true); } else { FATTN_DEC_CALL(6, 1, true); }
+        } else {
+            if (g4) { FATTN_DEC_CALL(4, 2, true); } else if (g8) { FATTN_DEC_CALL(8, 2, true); } else { FATTN_DEC_CALL(6, 2, true); }
+        }
+    } else if (!dpas && !d512 && !g2) switch (nq) {
+        case 1: if (g4) { FATTN_DEC_CALL(4, 1, false); } else if (g8) { FATTN_DEC_CALL(8, 1, false); } else { FATTN_DEC_CALL(6, 1, false); } break;
+        case 2: if (g4) { FATTN_DEC_CALL(4, 2, false); } else if (g8) { FATTN_DEC_CALL(8, 2, false); } else { FATTN_DEC_CALL(6, 2, false); } break;
         case 8:  // 5-8 tokens (MTP depth 4+, short n-gram drafts): v3 kernel, 32-key tiles
             if (g4) { FATTN_DEC_V3(4, 8); break; }  // 32 rows
             if (g8) {  // G=8 is 64 rows: v3<8, 8> would need ~74 KB SLM, so run two 4-token chunks
-                FATTN_DEC_CALL(8, 4);
+                FATTN_DEC_CALL(8, 4, false);
                 break;
             }
             FATTN_DEC_V3(6, 8);  // 48 rows, ~59 KB SLM
