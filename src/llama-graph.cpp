@@ -2199,12 +2199,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (moe_split != nullptr) {
-        // the maps are [1, n_expert, 1]: repeat them per token so get_rows can index them batch-wise
+        // the maps are [1, n_expert, 1] I32: get_rows indexes the expert dim and returns the remapped ids
+        // directly. Only a multi-token batch needs the map repeated per token (get_rows wants the table's
+        // batch dim to match the index's token count).
         auto remap = [&](ggml_tensor * map) -> ggml_tensor * {
-            ggml_tensor * t = ggml_repeat_4d(ctx0, map, 1, n_expert, n_tokens, 1);
+            ggml_tensor * t = n_tokens > 1 ? ggml_repeat_4d(ctx0, map, 1, n_expert, n_tokens, 1) : map;
             t = ggml_get_rows(ctx0, t, selected_experts);            // [1, n_expert_used, n_tokens]
-            t = ggml_reshape_2d(ctx0, t, n_expert_used, n_tokens);   // [n_expert_used, n_tokens]
-            return ggml_cast(ctx0, t, GGML_TYPE_I32);
+            return ggml_reshape_2d(ctx0, t, n_expert_used, n_tokens); // [n_expert_used, n_tokens]
         };
 
         ggml_tensor * ids_hot  = remap(moe_split->hot_map);

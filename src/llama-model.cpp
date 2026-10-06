@@ -2387,8 +2387,8 @@ void llama_model::create_expert_splits(llama_model_loader & ml) {
         split.down_cold    = make_cold(l.ffn_down_exps);
         split.gate_up_cold = make_cold(l.ffn_gate_up_exps);
 
-        ggml_tensor * cold_map = ggml_new_tensor_3d(ctx_cpu.get(), GGML_TYPE_F32, 1, n_expert, 1);
-        ggml_tensor * hot_map  = ggml_new_tensor_3d(ctx_hot.get(), GGML_TYPE_F32, 1, n_expert, 1);
+        ggml_tensor * cold_map = ggml_new_tensor_3d(ctx_cpu.get(), GGML_TYPE_I32, 1, n_expert, 1);
+        ggml_tensor * hot_map  = ggml_new_tensor_3d(ctx_hot.get(), GGML_TYPE_I32, 1, n_expert, 1);
 
         ggml_backend_buffer_ptr buf_cpu { ggml_backend_alloc_ctx_tensors_from_buft(ctx_cpu.get(), ggml_backend_cpu_buffer_type()) };
         ggml_backend_buffer_ptr buf_hot { ggml_backend_alloc_ctx_tensors_from_buft(ctx_hot.get(), buft_hot) };
@@ -2426,11 +2426,11 @@ void llama_model::create_expert_splits(llama_model_loader & ml) {
         fill_part(l.ffn_down_exps,    split.down_cold,    cold_list);
         fill_part(l.ffn_gate_up_exps, split.gate_up_cold, cold_list);
 
-        std::vector<float> hm(n_expert, -1.0f), cm(n_expert, -1.0f);
-        for (size_t i = 0; i < hot_list.size();  i++) { hm[hot_list[i]]  = (float) i; }
-        for (size_t i = 0; i < cold_list.size(); i++) { cm[cold_list[i]] = (float) i; }
-        ggml_backend_tensor_set(hot_map,  hm.data(), 0, hm.size()*sizeof(float));
-        ggml_backend_tensor_set(cold_map, cm.data(), 0, cm.size()*sizeof(float));
+        std::vector<int32_t> hm(n_expert, -1), cm(n_expert, -1);
+        for (size_t i = 0; i < hot_list.size();  i++) { hm[hot_list[i]]  = (int32_t) i; }
+        for (size_t i = 0; i < cold_list.size(); i++) { cm[cold_list[i]] = (int32_t) i; }
+        ggml_backend_tensor_set(hot_map,  hm.data(), 0, hm.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(cold_map, cm.data(), 0, cm.size()*sizeof(int32_t));
 
         split.up_hot       = l.ffn_up_exps;
         split.gate_hot     = l.ffn_gate_exps;
