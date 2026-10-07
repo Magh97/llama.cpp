@@ -25,3 +25,28 @@ Reference, Arc Pro B60 24 GB, Linux, oneAPI 2025.3, Level Zero 26.35, `tg128`, 2
 
 Results from other Arc cards (B580, B70, Lunar Lake, ...) are the most useful thing: post card, driver
 version, model and quant, the depths and what you got in the repository's Discussions.
+
+## Numerical check
+
+`numeric-ab.py` answers the other half of the question: not "is it faster" but "does it still compute the
+same thing". One binary, one fixed text corpus, one fixed prompt, and only the kernel switched off between
+runs - so a difference can only come from the kernel. It prints perplexity and a greedy output hash for four
+configurations, so each pair isolates one thing with the KV type held fixed:
+
+| pair | isolates |
+| --- | --- |
+| `q8_0+fork` vs `q8_0+up` | the q8_0 decode fast path, same q8_0 KV |
+| `f16+fork` vs `f16+up` | XMX (DPAS) decode attention and the work-group splits, same f16 KV |
+
+Perplexity runs with `-b 1` on purpose: with a large batch llama-perplexity only exercises prefill
+attention, which this work did not touch, while a batch of one goes through the decode kernel that did
+change. Greedy decoding is an argmax, so both numbers are deterministic and comparable across days.
+
+```sh
+LLAMA_BIN=./build-sycl/bin MODELS_DIR=~/ai-sys/lm-studio-models \
+    python3 benches/arc-decode-attention/numeric-ab.py            # optional regex filters the models
+```
+
+Over 35 models on the Arc Pro B60: `ΔPPL` is **0.0000%** for the XMX decode attention and the splits on
+every model, **−0.68% … +1.70%** (mean 0.19%) for the q8_0 fast path, and the greedy output is **identical
+in all four configurations on every model**. The raw 36-row output is in `numeric-ab-results.json`.

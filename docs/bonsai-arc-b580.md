@@ -384,6 +384,33 @@ path serves 1-2 query tokens; MTP or n-gram verify batches of 3-8 tokens still u
 pair it with `--spec-draft-n-max 1` or with q4_0 KV when speculating. Greedy output stays coherent and matches the
 generic path where the choice is clear, with the same near-tie flips in free-form text as the other shapes.
 
+### Numerical equivalence (35 models)
+
+The speed tables raise an obvious question: does the faster decode still compute the same thing? Measured with
+`benches/arc-decode-attention/numeric-ab.py` - one binary, one fixed text corpus (sha256 `b6a9a182563226f3`,
+built from this repo's docs and written next to the results; a later docs revision changes the absolute PPL
+but not the comparisons, which are always made within one run), one fixed prompt, and only the kernel switched
+off between runs, so a difference can only come from the kernel.
+Perplexity runs with `-b 1` so every token goes through the decode path (with a large batch, llama-perplexity
+only exercises prefill attention, which this work did not touch), and greedy decoding is an argmax, so both
+numbers are deterministic and repeatable.
+
+Arc Pro B60 24 GB, Linux, oneAPI 2025.3, 35 models - every GGUF in the models directory except an mmproj and
+`gemma-4-12B-it-MTP-Q8_0`, which does not load there (`failed to create context`):
+
+| comparison | KV type | result over 35 models |
+|---|---|---|
+| XMX (DPAS) decode attention + work-group splits vs upstream | f16 | **ΔPPL = 0.0000% on every model** |
+| q8_0 decode fast path vs upstream | q8_0 | **−0.68% … +1.70%**, mean 0.19% |
+| greedy text across all four kernel configurations | - | **identical on every model** (35/35) |
+
+The XMX decode attention and the splits are numerically indistinguishable from the generic path. The q8_0 fast
+path is equivalent in behaviour but not bit-identical, so its +47% at 128K is not free: the two worst models are
+Ornith-1.5-35B Q4_K_M (+1.70%) and Kwaipilot KAT-Coder-V2.5-Dev-MTP-APEX-I-Mini (+1.20%), everything else stays
+under 0.7%, and no model changes what it answers for a fixed prompt. Reproduce with
+`python3 benches/arc-decode-attention/numeric-ab.py`; the raw 36-row output is in
+`benches/arc-decode-attention/numeric-ab-results.json`.
+
 ### Speculative decoding (MTP) after the faster decode
 
 The faster the base decode, the less drafting pays. On a 256-token code answer (llama-cli `Generation:`, greedy,
